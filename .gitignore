@@ -1,0 +1,10 @@
+node_modules
+.svelte-kit
+build
+.vercel
+.env
+.env.local
+.dev.vars
+dist
+.wrangler
+.DS_Store
