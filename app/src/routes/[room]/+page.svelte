@@ -2,9 +2,13 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { onMount, onDestroy } from 'svelte';
+	import { browser } from '$app/environment';
 	import { media } from '$lib/stores/media.svelte';
-	import { loadPreferences, saveName } from '$lib/utils/preferences';
+	import { room } from '$lib/stores/room.svelte';
+	import { loadPreferences, saveName, getClientId } from '$lib/utils/preferences';
 	import { playTestTone } from '$lib/utils/devices';
+	import PreBriefTimeline from '$lib/components/PreBriefTimeline.svelte';
+	import type { PreBriefClip } from '$lib/room/protocol';
 
 	let name = $state('');
 	let joining = $state(false);
@@ -17,7 +21,11 @@
 	let camDropdown = $state(false);
 	let spkDropdown = $state(false);
 	let peekNames = $state<string[]>([]);
+	let peekClipCount = $state(0);
 	let peekWs: WebSocket | null = null;
+	let roomConnected = $state(false);
+
+	const clientId = browser ? getClientId() : '';
 
 	let micCtx: AudioContext | null = null;
 	let micAnalyser: AnalyserNode | null = null;
@@ -26,6 +34,14 @@
 
 	const roomId = $derived($page.params.room);
 	const shareUrl = $derived(typeof window !== 'undefined' ? window.location.href : '');
+
+	function getRoomServerUrl() {
+		if (!browser) return 'ws://localhost:8787';
+		const env = import.meta.env.VITE_ROOM_SERVER_URL;
+		if (env) return env;
+		const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+		return `${proto}://${window.location.host}/ws-room`;
+	}
 
 	function setupMicAnalyser(stream: MediaStream) {
 		cleanupMicAnalyser();
@@ -85,7 +101,8 @@
 					const msg = JSON.parse(e.data);
 					if (msg.type === 'peek-result') {
 						peekNames = msg.participants.map((p: { name: string }) => p.name);
-						console.log('[PreJoin] Peek result:', peekNames);
+						peekClipCount = msg.clipCount ?? 0;
+						console.log('[PreJoin] Peek result:', peekNames, 'clips:', peekClipCount);
 						peekWs?.close();
 						peekWs = null;
 					}
@@ -100,6 +117,22 @@
 		} catch (e) {
 			console.warn('[PreJoin] Peek failed:', e);
 		}
+	}
+
+	function connectRoom() {
+		if (roomConnected || !roomId) return;
+		const wsUrl = getRoomServerUrl();
+		room.connect(wsUrl, roomId);
+		room.join(name || 'Anonymous', '', clientId);
+		roomConnected = true;
+	}
+
+	function handleWatchProgress(clipId: string, progress: number) {
+		room.reportClipWatched(clipId, clientId, name || 'Anonymous', progress);
+	}
+
+	function handleDeleteClip(clipId: string) {
+		room.deleteClip(clipId);
 	}
 
 	onMount(async () => {
@@ -117,10 +150,13 @@
 		}
 
 		nameInput?.focus();
+
+		connectRoom();
 	});
 
 	onDestroy(() => {
 		cleanupMicAnalyser();
+		room.disconnect();
 		if (peekWs) {
 			peekWs.onmessage = null;
 			peekWs.close();
@@ -292,6 +328,33 @@
 					<p class="mt-1.5 text-[13px] text-text-muted">No one else is here yet</p>
 				{/if}
 			</div>
+
+			<!-- Pre-Brief Timeline -->
+			{#if room.clips.length > 0}
+				<PreBriefTimeline
+					clips={room.clips}
+					viewStatuses={room.viewStatuses}
+					{clientId}
+					onWatchProgress={handleWatchProgress}
+					onDelete={handleDeleteClip}
+					isAuthor={(authorId) => authorId === clientId}
+				/>
+			{/if}
+
+			<!-- Record a pre-brief button -->
+			<button
+				onclick={() => goto(`/${roomId}/record`)}
+				class="group flex w-full cursor-pointer items-center gap-3 rounded-xl border border-accent/20 bg-accent/5 px-4 py-3 text-left transition-all duration-200 hover:border-accent/40 hover:bg-accent/10"
+			>
+				<div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent/15 text-accent">
+					<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
+				</div>
+				<div class="min-w-0 flex-1">
+					<div class="text-[13px] font-medium text-text-primary">Record a pre-brief</div>
+					<div class="text-[11px] text-text-muted mt-0.5">Share context before the meeting</div>
+				</div>
+				<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-text-muted transition-colors group-hover:text-accent"><path d="m9 18 6-6-6-6"/></svg>
+			</button>
 
 			<button
 				onclick={copyLink}

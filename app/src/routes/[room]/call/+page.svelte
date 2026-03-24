@@ -617,7 +617,7 @@
 	}
 
 	function connectToRoom() {
-		const roomCleanup = room.connect(ROOM_SERVER_URL, roomId);
+		room.connect(ROOM_SERVER_URL, roomId);
 
 		room.join(userName, sessionId, clientId, localAudioTrackName, localVideoTrackName);
 
@@ -666,7 +666,7 @@
 		window.addEventListener('beforeunload', handleBeforeUnload);
 
 		cleanup = () => {
-			roomCleanup();
+			room.disconnect();
 			unsubMsg();
 			window.removeEventListener('beforeunload', handleBeforeUnload);
 		};

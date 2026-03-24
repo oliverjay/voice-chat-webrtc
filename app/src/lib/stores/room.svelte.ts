@@ -1,17 +1,29 @@
 import { RoomSocket } from '$lib/room/socket';
-import type { Participant, ChatMessage, ServerMessage } from '$lib/room/protocol';
+import type { Participant, ChatMessage, PreBriefClip, ClipViewStatus, ServerMessage } from '$lib/room/protocol';
 
 class RoomStore {
 	participants = $state<Participant[]>([]);
 	chatMessages = $state<ChatMessage[]>([]);
+	clips = $state<PreBriefClip[]>([]);
+	viewStatuses = $state<ClipViewStatus[]>([]);
 	myId = $state<string>('');
 	connected = $state(false);
 	roomId = $state<string>('');
 	socket: RoomSocket | null = null;
 	private messageListeners = new Set<(msg: ServerMessage) => void>();
 	private joinInfo: { name: string; sessionId: string; clientId?: string; audioTrack?: string; videoTrack?: string } | null = null;
+	private pollInterval: ReturnType<typeof setInterval> | null = null;
 
 	connect(roomServerUrl: string, roomId: string) {
+		if (this.socket) {
+			this.socket.disconnect();
+			this.socket = null;
+		}
+		if (this.pollInterval) {
+			clearInterval(this.pollInterval);
+			this.pollInterval = null;
+		}
+
 		this.roomId = roomId;
 		this.socket = new RoomSocket(roomServerUrl, roomId);
 
@@ -37,15 +49,23 @@ class RoomStore {
 
 		this.socket.connect();
 
-		const checkConnected = setInterval(() => {
+		this.pollInterval = setInterval(() => {
 			if (this.socket) {
 				this.connected = this.socket.connected;
 			}
 		}, 500);
+	}
 
-		return () => {
-			clearInterval(checkConnected);
-		};
+	disconnect() {
+		if (this.pollInterval) {
+			clearInterval(this.pollInterval);
+			this.pollInterval = null;
+		}
+		if (this.socket) {
+			this.socket.disconnect();
+			this.socket = null;
+		}
+		this.connected = false;
 	}
 
 	onMessage(listener: (msg: ServerMessage) => void) {
@@ -73,13 +93,26 @@ class RoomStore {
 		this.socket.send({ type: 'chat', text });
 	}
 
+	addClip(clip: PreBriefClip) {
+		this.socket?.send({ type: 'clip-add', clip });
+	}
+
+	deleteClip(clipId: string) {
+		this.socket?.send({ type: 'clip-delete', clipId });
+	}
+
+	reportClipWatched(clipId: string, clientId: string, participantName: string, progress: number) {
+		this.socket?.send({ type: 'clip-watched', clipId, clientId, participantName, progress });
+	}
+
 	leave() {
-		this.socket?.disconnect();
-		this.socket = null;
+		this.disconnect();
+		this.messageListeners.clear();
 		this.participants = [];
 		this.chatMessages = [];
+		this.clips = [];
+		this.viewStatuses = [];
 		this.myId = '';
-		this.connected = false;
 		this.joinInfo = null;
 	}
 
@@ -93,6 +126,8 @@ class RoomStore {
 				this.participants = msg.participants;
 				this.chatMessages = msg.chat;
 				this.myId = msg.yourId;
+				this.clips = msg.clips || [];
+				this.viewStatuses = msg.viewStatus || [];
 				this.connected = true;
 				break;
 
@@ -122,6 +157,27 @@ class RoomStore {
 				console.log('[Room] received chat-message from', msg.message.name, ':', msg.message.text);
 				this.chatMessages = [...this.chatMessages, msg.message];
 				break;
+
+			case 'clip-added':
+				this.clips = [...this.clips, msg.clip];
+				break;
+
+			case 'clip-deleted':
+				this.clips = this.clips.filter(c => c.id !== msg.clipId);
+				this.viewStatuses = this.viewStatuses.filter(v => v.clipId !== msg.clipId);
+				break;
+
+			case 'clip-view-updated': {
+				const idx = this.viewStatuses.findIndex(
+					v => v.clipId === msg.status.clipId && v.clientId === msg.status.clientId
+				);
+				if (idx >= 0) {
+					this.viewStatuses = this.viewStatuses.map((v, i) => i === idx ? msg.status : v);
+				} else {
+					this.viewStatuses = [...this.viewStatuses, msg.status];
+				}
+				break;
+			}
 
 			case 'error':
 				console.error('[Room] Server error:', msg.message);

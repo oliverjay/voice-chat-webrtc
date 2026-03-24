@@ -16,6 +16,28 @@ interface ChatMessage {
 	timestamp: number;
 }
 
+interface PreBriefClip {
+	id: string;
+	roomId: string;
+	authorId: string;
+	authorName: string;
+	title: string;
+	duration: number;
+	mediaUrl: string;
+	mediaType: 'video' | 'audio';
+	createdAt: string;
+	order: number;
+}
+
+interface ClipViewStatus {
+	clipId: string;
+	clientId: string;
+	participantName: string;
+	watched: boolean;
+	progress: number;
+	watchedAt: string | null;
+}
+
 interface Env {}
 
 const MAX_CHAT_HISTORY = 50;
@@ -26,16 +48,38 @@ export class Room implements DurableObject {
 	private connections = new Map<WebSocket, string>();
 	private chat: ChatMessage[] = [];
 	private disconnectTimers = new Map<string, number>();
+	private clips: PreBriefClip[] = [];
+	private viewStatuses: ClipViewStatus[] = [];
+	private clipsLoaded = false;
 
 	constructor(
 		private ctx: DurableObjectState,
 		private env: Env
 	) {}
 
+	private async loadClips() {
+		if (this.clipsLoaded) return;
+		const stored = await this.ctx.storage.get<PreBriefClip[]>('clips');
+		this.clips = stored || [];
+		const views = await this.ctx.storage.get<ClipViewStatus[]>('viewStatuses');
+		this.viewStatuses = views || [];
+		this.clipsLoaded = true;
+	}
+
+	private async saveClips() {
+		await this.ctx.storage.put('clips', this.clips);
+	}
+
+	private async saveViewStatuses() {
+		await this.ctx.storage.put('viewStatuses', this.viewStatuses);
+	}
+
 	async fetch(request: Request): Promise<Response> {
 		if (request.headers.get('Upgrade') !== 'websocket') {
 			return new Response('Expected WebSocket', { status: 400 });
 		}
+
+		await this.loadClips();
 
 		const pair = new WebSocketPair();
 		const [client, server] = Object.values(pair);
@@ -118,7 +162,9 @@ export class Room implements DurableObject {
 						type: 'snapshot',
 						participants: Array.from(this.participants.values()),
 						chat: this.chat.slice(-MAX_CHAT_HISTORY),
-						yourId: existingId
+						yourId: existingId,
+						clips: this.clips,
+						viewStatus: this.viewStatuses
 					});
 
 					this.broadcast({
@@ -147,7 +193,9 @@ export class Room implements DurableObject {
 						type: 'snapshot',
 						participants: Array.from(this.participants.values()),
 						chat: this.chat.slice(-MAX_CHAT_HISTORY),
-						yourId: id
+						yourId: id,
+						clips: this.clips,
+						viewStatus: this.viewStatuses
 					});
 
 					this.broadcast(
@@ -226,7 +274,62 @@ export class Room implements DurableObject {
 
 			case 'peek': {
 				const names = Array.from(this.participants.values()).map(p => ({ name: p.name }));
-				this.send(ws, { type: 'peek-result', participants: names });
+				this.send(ws, { type: 'peek-result', participants: names, clipCount: this.clips.length });
+				break;
+			}
+
+			case 'clip-add': {
+				const pid = this.connections.get(ws);
+				if (!pid) return;
+				const clip = msg.clip as PreBriefClip;
+				if (!clip?.id) return;
+				clip.order = this.clips.length;
+				this.clips.push(clip);
+				await this.saveClips();
+				this.broadcast({ type: 'clip-added', clip });
+				break;
+			}
+
+			case 'clip-delete': {
+				const pid = this.connections.get(ws);
+				if (!pid) return;
+				const clipId = msg.clipId as string;
+				this.clips = this.clips.filter(c => c.id !== clipId);
+				this.viewStatuses = this.viewStatuses.filter(v => v.clipId !== clipId);
+				await this.saveClips();
+				await this.saveViewStatuses();
+				this.broadcast({ type: 'clip-deleted', clipId });
+				break;
+			}
+
+			case 'clip-watched': {
+				const clientId = msg.clientId as string;
+				const clipId = msg.clipId as string;
+				const participantName = msg.participantName as string;
+				const progress = Math.min(1, Math.max(0, Number(msg.progress) || 0));
+				if (!clientId || !clipId) return;
+
+				const existing = this.viewStatuses.find(v => v.clipId === clipId && v.clientId === clientId);
+				const watched = progress >= 0.9;
+				if (existing) {
+					existing.progress = Math.max(existing.progress, progress);
+					existing.watched = existing.watched || watched;
+					existing.participantName = participantName;
+					if (watched && !existing.watchedAt) existing.watchedAt = new Date().toISOString();
+				} else {
+					this.viewStatuses.push({
+						clipId,
+						clientId,
+						participantName,
+						watched,
+						progress,
+						watchedAt: watched ? new Date().toISOString() : null
+					});
+				}
+				await this.saveViewStatuses();
+
+				const status = existing || this.viewStatuses[this.viewStatuses.length - 1];
+				this.broadcast({ type: 'clip-view-updated', status });
 				break;
 			}
 		}

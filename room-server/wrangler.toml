@@ -7,6 +7,10 @@ bindings = [
   { name = "ROOMS", class_name = "Room" }
 ]
 
+[[r2_buckets]]
+binding = "CLIPS_BUCKET"
+bucket_name = "vc-clips"
+
 [[migrations]]
 tag = "v1"
 new_classes = ["Room"]
