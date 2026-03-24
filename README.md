@@ -18,6 +18,7 @@ The frontend handles the UI, media capture, and WebRTC peer connections. The roo
 | Frontend | Svelte 5, SvelteKit 2, TypeScript |
 | Styling | Tailwind CSS 4 |
 | Media relay | Cloudflare Calls (SFU) |
+| Clip storage | Cloudflare R2 |
 | Signaling | Cloudflare Workers + Durable Objects (WebSockets) |
 | TURN | Cloudflare TURN (optional, for firewall traversal) |
 | App hosting | Vercel |
@@ -25,6 +26,8 @@ The frontend handles the UI, media capture, and WebRTC peer connections. The roo
 ## Features
 
 - **Video/audio calls** with automatic active speaker detection
+- **Pre-brief clips** — record and share short video/audio clips before the meeting so everyone arrives prepared
+- **Timeline view** — watch clips in order on the pre-join screen with per-participant progress tracking
 - **Simulcast** — 3 encoding layers adapt to each participant's bandwidth
 - **Screen sharing** with tab audio capture
 - **Chat** with real-time delivery and unread indicators
@@ -120,11 +123,12 @@ app/
 │   ├── routes/
 │   │   ├── +page.svelte              Landing page
 │   │   ├── new/+page.ts              Auto-redirect to new room
-│   │   ├── [room]/+page.svelte       Pre-join screen
+│   │   ├── [room]/+page.svelte       Pre-join screen (+ clip timeline)
 │   │   ├── [room]/call/+page.svelte  In-call UI
+│   │   ├── [room]/record/+page.svelte  Pre-brief clip recorder
 │   │   └── api/                      Server routes (session, tracks, TURN)
 │   └── lib/
-│       ├── components/               VideoTile, ControlBar, ChatPanel
+│       ├── components/               VideoTile, ControlBar, ChatPanel, PreBriefTimeline
 │       ├── stores/                   media.svelte.ts, room.svelte.ts
 │       ├── webrtc/session.ts         Cloudflare Calls API client
 │       ├── room/                     WebSocket protocol + socket client
@@ -135,8 +139,8 @@ app/
 
 room-server/
 ├── src/
-│   ├── index.ts                      Worker entry (HTTP → WebSocket upgrade)
-│   └── room.ts                       Durable Object (room state, presence, chat)
+│   ├── index.ts                      Worker entry (WebSocket upgrade, R2 clip API)
+│   └── room.ts                       Durable Object (room state, presence, chat, clips)
 └── wrangler.toml
 ```
 
