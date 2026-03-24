@@ -65,8 +65,10 @@ export default {
 			if (!obj) {
 				return new Response('Not found', { status: 404, headers: corsHeaders(request) });
 			}
+			const rawType = obj.httpMetadata?.contentType || 'video/webm';
+			const contentType = rawType.split(';')[0].trim();
 			const headers = new Headers(corsHeaders(request));
-			headers.set('Content-Type', obj.httpMetadata?.contentType || 'video/webm');
+			headers.set('Content-Type', contentType);
 			headers.set('Cache-Control', 'public, max-age=86400');
 			return new Response(obj.body, { headers });
 		}

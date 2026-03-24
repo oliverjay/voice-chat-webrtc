@@ -237,6 +237,7 @@
 				<video
 					bind:this={videoEl}
 					src={activeClip.mediaUrl}
+					crossorigin="anonymous"
 					autoplay
 					playsinline
 					controls
