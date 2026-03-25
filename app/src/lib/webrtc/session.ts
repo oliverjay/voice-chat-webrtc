@@ -42,7 +42,7 @@ export async function pushLocalTracks(
 
 export async function pullRemoteTracks(
 	sessionId: string,
-	tracks: Array<{ sessionId: string; trackName: string }>
+	tracks: Array<{ sessionId: string; trackName: string; simulcast?: SimulcastPrefs }>
 ): Promise<TracksResponse> {
 	const res = await fetch('/api/tracks', {
 		method: 'POST',
@@ -53,12 +53,42 @@ export async function pullRemoteTracks(
 			tracks: tracks.map((t) => ({
 				location: 'remote',
 				sessionId: t.sessionId,
-				trackName: t.trackName
+				trackName: t.trackName,
+				...(t.simulcast ? { simulcast: t.simulcast } : {})
 			}))
 		})
 	});
 	if (!res.ok) throw new Error(`Failed to pull tracks: ${res.status}`);
 	return res.json();
+}
+
+export interface SimulcastPrefs {
+	preferredRid: string;
+	priorityOrdering?: 'none' | 'asciibetical';
+	ridNotAvailable?: 'none' | 'asciibetical';
+}
+
+export async function updateTrackSimulcast(
+	sessionId: string,
+	tracks: Array<{ mid: string; sessionId: string; trackName: string; simulcast: SimulcastPrefs }>
+): Promise<void> {
+	const res = await fetch('/api/tracks-update', {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			sessionId,
+			tracks: tracks.map((t) => ({
+				location: 'remote',
+				mid: t.mid,
+				sessionId: t.sessionId,
+				trackName: t.trackName,
+				simulcast: t.simulcast
+			}))
+		})
+	});
+	if (!res.ok) {
+		console.warn('[WebRTC] updateTrackSimulcast failed:', res.status);
+	}
 }
 
 export async function renegotiate(sessionId: string, sdpAnswer: string): Promise<void> {

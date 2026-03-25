@@ -20,7 +20,6 @@ export async function getDisplayStream(): Promise<MediaStream> {
 	return navigator.mediaDevices.getDisplayMedia({
 		video: { frameRate: { ideal: 24, max: 30 } },
 		audio: true,
-		selfBrowserSurface: 'exclude',
 		surfaceSwitching: 'include',
 		systemAudio: 'include'
 	} as any);

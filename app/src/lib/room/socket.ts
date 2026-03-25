@@ -10,7 +10,7 @@ export class RoomSocket {
 	private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 	private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 	private reconnectAttempts = 0;
-	private maxReconnectAttempts = 5;
+	private maxReconnectAttempts = 10;
 	private _connected = false;
 
 	constructor(
@@ -23,7 +23,7 @@ export class RoomSocket {
 	}
 
 	connect() {
-		if (this.ws) this.disconnect();
+		this.closeSocket(false);
 
 		const wsUrl = `${this.url}/room/${this.roomId}`;
 		console.log('[RoomSocket] connecting to', wsUrl);
@@ -78,7 +78,17 @@ export class RoomSocket {
 		return () => this.openHandlers.delete(handler);
 	}
 
+	/** Close socket without sending leave — used when replacing the connection */
+	close() {
+		this.closeSocket(false);
+	}
+
+	/** Close socket and send leave — used when intentionally leaving the room */
 	disconnect() {
+		this.closeSocket(true);
+	}
+
+	private closeSocket(sendLeave: boolean) {
 		this._connected = false;
 		this.stopHeartbeat();
 		if (this.reconnectTimeout) {
@@ -89,7 +99,7 @@ export class RoomSocket {
 			this.ws.onclose = null;
 			this.ws.onerror = null;
 			try {
-				this.send({ type: 'leave' });
+				if (sendLeave) this.send({ type: 'leave' });
 				this.ws.close(1000);
 			} catch {}
 			this.ws = null;

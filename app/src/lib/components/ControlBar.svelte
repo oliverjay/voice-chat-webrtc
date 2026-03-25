@@ -1,14 +1,17 @@
 <script lang="ts">
 	import type { DeviceInfo } from '$lib/utils/devices';
+	import { personas } from '$lib/agents/personas';
 
 	let {
 		audioEnabled = true,
 		videoEnabled = true,
+		speakerMuted = false,
 		screenEnabled = false,
 		chatOpen = false,
 		unreadChat = false,
 		roomId = '',
 		showInvite = false,
+		isAlone = true,
 		mics = [],
 		cameras = [],
 		speakers = [],
@@ -16,23 +19,30 @@
 		selectedCamera = '',
 		selectedSpeaker = '',
 		connectionQuality = 'unknown',
+		activeAgents = new Set<string>(),
+		loadingAgents = new Set<string>(),
 		onToggleAudio,
 		onToggleVideo,
+		onToggleSpeaker,
 		onToggleScreen,
 		onToggleChat,
 		onLeave,
 		onSwitchMic,
 		onSwitchCamera,
 		onSwitchSpeaker,
-		onInviteOpenChange
+		onInviteOpenChange,
+		onAddAgent,
+		onRemoveAgent
 	}: {
 		audioEnabled?: boolean;
 		videoEnabled?: boolean;
+		speakerMuted?: boolean;
 		screenEnabled?: boolean;
 		chatOpen?: boolean;
 		unreadChat?: boolean;
 		roomId?: string;
 		showInvite?: boolean;
+		isAlone?: boolean;
 		mics?: DeviceInfo[];
 		cameras?: DeviceInfo[];
 		speakers?: DeviceInfo[];
@@ -40,8 +50,11 @@
 		selectedCamera?: string;
 		selectedSpeaker?: string;
 		connectionQuality?: 'good' | 'fair' | 'poor' | 'unknown';
+		activeAgents?: Set<string>;
+		loadingAgents?: Set<string>;
 		onToggleAudio: () => void;
 		onToggleVideo: () => void;
+		onToggleSpeaker: () => void;
 		onToggleScreen: () => void;
 		onToggleChat: () => void;
 		onLeave: () => void;
@@ -49,6 +62,8 @@
 		onSwitchCamera?: (id: string) => void;
 		onSwitchSpeaker?: (id: string) => void;
 		onInviteOpenChange?: (open: boolean) => void;
+		onAddAgent?: (slug: string) => void;
+		onRemoveAgent?: (slug: string) => void;
 	} = $props();
 
 	const qualityColor = $derived(
@@ -63,7 +78,6 @@
 	);
 
 	let inviteOpen = $state(false);
-	let inviteAutoOpened = $state(false);
 
 	$effect(() => {
 		onInviteOpenChange?.(inviteOpen);
@@ -77,6 +91,11 @@
 	let micMenu = $state(false);
 	let camMenu = $state(false);
 	let spkMenu = $state(false);
+	let longPressed = false;
+	let pressTimer: ReturnType<typeof setTimeout>;
+	let hoverTimer: ReturnType<typeof setTimeout>;
+	let nudgeDismissed = $state(false);
+	let nudgeTimer: ReturnType<typeof setTimeout>;
 
 	function closeAllMenus() {
 		micMenu = false;
@@ -84,17 +103,14 @@
 		spkMenu = false;
 	}
 
+	const showNudge = $derived(isAlone && !inviteOpen && !nudgeDismissed);
+
 	$effect(() => {
-		if (showInvite && !inviteAutoOpened) {
-			inviteOpen = true;
-			inviteAutoOpened = true;
+		clearTimeout(nudgeTimer);
+		if (showNudge) {
+			nudgeTimer = setTimeout(() => { nudgeDismissed = true; }, 8000);
 		}
-		if (!showInvite) {
-			if (inviteAutoOpened && inviteOpen) {
-				inviteOpen = false;
-			}
-			inviteAutoOpened = false;
-		}
+		return () => clearTimeout(nudgeTimer);
 	});
 	let copied = $state(false);
 
@@ -134,9 +150,22 @@
 	let dragOriginOffsetX = 0;
 	let dragOriginOffsetY = 0;
 	let didMove = false;
+	let lastTapTime = 0;
+
+	function resetPosition() {
+		offsetX = 0;
+		offsetY = 0;
+	}
 
 	function onDragStart(e: PointerEvent) {
 		if ((e.target as HTMLElement).closest('button')) return;
+		const now = Date.now();
+		if (now - lastTapTime < 300) {
+			resetPosition();
+			lastTapTime = 0;
+			return;
+		}
+		lastTapTime = now;
 		dragging = true;
 		didMove = false;
 		dragStartX = e.clientX;
@@ -176,80 +205,59 @@
 	}
 </script>
 
-<div class="fixed bottom-0 left-0 right-0 z-50 flex justify-center px-2 pb-[calc(1.25rem+env(safe-area-inset-bottom))] sm:pb-5 pointer-events-none">
+<div class="fixed bottom-0 left-0 right-0 z-50 flex justify-center px-2 pb-[calc(1.25rem+env(safe-area-inset-bottom))] sm:pb-5 pointer-events-none transition-all duration-300 {screenEnabled ? 'sm:pb-14' : ''}" >
 	<div
 		bind:this={barEl}
 		class="pointer-events-auto flex items-center gap-0.5 sm:gap-1 rounded-2xl border border-white/[0.08] bg-[#141416]/90 px-1.5 sm:px-2 py-1.5 sm:py-2 shadow-2xl backdrop-blur-xl {dragging ? '' : 'transition-transform duration-200'}"
 		style="transform: translate({offsetX}px, {offsetY}px)"
 	>
-		<!-- Mic with device picker -->
-		<div class="relative flex items-stretch" data-device-menu>
-			<button
-				onclick={onToggleAudio}
-				class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-l-xl transition-all duration-150 active:scale-90
-					{!audioEnabled ? 'bg-danger/15 text-danger hover:bg-danger/25' : 'text-text-secondary hover:bg-white/[0.06] hover:text-text-primary'}
-					{mics.length <= 1 ? 'rounded-r-xl' : ''}"
-				title={audioEnabled ? 'Mute (M)' : 'Unmute (M)'}
-			>
-				{@render icon(audioEnabled ? 'mic' : 'mic-off')}
-			</button>
-			{#if mics.length > 1}
-				<button
-					onclick={() => { micMenu = !micMenu; camMenu = false; spkMenu = false; }}
-					class="hidden sm:flex h-10 w-5 cursor-pointer items-center justify-center rounded-r-xl border-l border-white/[0.06] transition-all duration-150
-						{!audioEnabled ? 'bg-danger/15 text-danger/60 hover:bg-danger/25 hover:text-danger' : 'text-text-muted hover:bg-white/[0.06] hover:text-text-primary'}
-						{micMenu ? 'bg-white/[0.06] text-text-primary' : ''}"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
-				</button>
-			{/if}
-			{#if micMenu}
-				{@render deviceMenu(mics, selectedMic, (id) => { onSwitchMic?.(id); micMenu = false; }, 'Microphone')}
-			{/if}
-		</div>
+		<!-- Mic -->
+		{@render mediaControl({
+			enabled: audioEnabled,
+			onToggle: onToggleAudio,
+			iconOn: 'mic',
+			iconOff: 'mic-off',
+			titleOn: 'Mute (M)',
+			titleOff: 'Unmute (M)',
+			devices: mics,
+			selectedDevice: selectedMic,
+			onSwitchDevice: onSwitchMic,
+			menuLabel: 'Microphone',
+			menuOpen: micMenu,
+			onMenuToggle: () => { micMenu = !micMenu; camMenu = false; spkMenu = false; },
+		})}
 
-		<!-- Camera with device picker -->
-		<div class="relative flex items-stretch" data-device-menu>
-			<button
-				onclick={onToggleVideo}
-				class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-l-xl transition-all duration-150 active:scale-90
-					{!videoEnabled ? 'bg-danger/15 text-danger hover:bg-danger/25' : 'text-text-secondary hover:bg-white/[0.06] hover:text-text-primary'}
-					{cameras.length <= 1 ? 'rounded-r-xl' : ''}"
-				title={videoEnabled ? 'Camera off (V)' : 'Camera on (V)'}
-			>
-				{@render icon(videoEnabled ? 'cam' : 'cam-off')}
-			</button>
-			{#if cameras.length > 1}
-				<button
-					onclick={() => { camMenu = !camMenu; micMenu = false; spkMenu = false; }}
-					class="hidden sm:flex h-10 w-5 cursor-pointer items-center justify-center rounded-r-xl border-l border-white/[0.06] transition-all duration-150
-						{!videoEnabled ? 'bg-danger/15 text-danger/60 hover:bg-danger/25 hover:text-danger' : 'text-text-muted hover:bg-white/[0.06] hover:text-text-primary'}
-						{camMenu ? 'bg-white/[0.06] text-text-primary' : ''}"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
-				</button>
-			{/if}
-			{#if camMenu}
-				{@render deviceMenu(cameras, selectedCamera, (id) => { onSwitchCamera?.(id); camMenu = false; }, 'Camera')}
-			{/if}
-		</div>
+		<!-- Camera -->
+		{@render mediaControl({
+			enabled: videoEnabled,
+			onToggle: onToggleVideo,
+			iconOn: 'cam',
+			iconOff: 'cam-off',
+			titleOn: 'Camera off (V)',
+			titleOff: 'Camera on (V)',
+			devices: cameras,
+			selectedDevice: selectedCamera,
+			onSwitchDevice: onSwitchCamera,
+			menuLabel: 'Camera',
+			menuOpen: camMenu,
+			onMenuToggle: () => { camMenu = !camMenu; micMenu = false; spkMenu = false; },
+		})}
 
-		<!-- Speaker picker (hidden on mobile, rarely multiple speakers on phones) -->
-		{#if speakers.length > 1}
-			<div class="relative hidden sm:flex items-stretch" data-device-menu>
-				<button
-					onclick={() => { spkMenu = !spkMenu; micMenu = false; camMenu = false; }}
-					class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-xl transition-all duration-150 active:scale-90 text-text-secondary hover:bg-white/[0.06] hover:text-text-primary
-						{spkMenu ? 'bg-white/[0.06] text-text-primary' : ''}"
-					title="Speaker"
-				>
-					{@render icon('speaker')}
-				</button>
-				{#if spkMenu}
-					{@render deviceMenu(speakers, selectedSpeaker, (id) => { onSwitchSpeaker?.(id); spkMenu = false; }, 'Speaker')}
-				{/if}
-			</div>
-		{/if}
+		<!-- Speaker -->
+		{@render mediaControl({
+			enabled: !speakerMuted,
+			onToggle: onToggleSpeaker,
+			iconOn: 'speaker',
+			iconOff: 'speaker-off',
+			titleOn: 'Mute speaker',
+			titleOff: 'Unmute speaker',
+			devices: speakers,
+			selectedDevice: selectedSpeaker,
+			onSwitchDevice: onSwitchSpeaker,
+			menuLabel: 'Speaker',
+			menuOpen: spkMenu,
+			onMenuToggle: () => { spkMenu = !spkMenu; micMenu = false; camMenu = false; },
+		})}
 
 		<!-- Screen share (hidden on mobile — not supported) -->
 		<button
@@ -264,40 +272,99 @@
 		<!-- Invite -->
 		<div class="relative" data-invite-popup>
 			<button
-				onclick={() => { inviteOpen = !inviteOpen; if (inviteOpen) copyInvite(); }}
+				onclick={() => { nudgeDismissed = true; inviteOpen = !inviteOpen; if (inviteOpen) copyInvite(); }}
 				class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-xl transition-all duration-150 active:scale-90
-					{inviteOpen ? 'bg-accent/15 text-accent hover:bg-accent/25' : 'text-text-secondary hover:bg-white/[0.06] hover:text-text-primary'}"
+					{inviteOpen ? 'bg-accent/15 text-accent hover:bg-accent/25' : 'text-text-secondary hover:bg-white/[0.06] hover:text-text-primary'}
+					{showNudge ? 'animate-invite-glow' : ''}"
 				title="Invite people"
 			>
 				{@render icon('invite')}
 			</button>
 
-			{#if inviteOpen}
-				<div class="fixed sm:absolute bottom-full left-2 right-2 sm:left-1/2 mb-3 sm:w-72 sm:-translate-x-1/2 sm:right-auto rounded-xl border border-white/[0.08] bg-[#18181b]/98 p-3.5 shadow-2xl backdrop-blur-xl sm:bottom-full bottom-16">
-					{#if showInvite}
-						<div class="mb-2.5 flex items-center gap-2 text-[13px] text-text-secondary">
-							<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 text-text-muted"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/></svg>
-							No one else is here yet — invite someone!
-						</div>
-					{:else}
-						<div class="mb-1.5 text-[13px] font-semibold">Invite people</div>
-						<div class="text-text-muted mb-2.5 text-[12px] leading-relaxed">Share this link to let others join.</div>
-					{/if}
-					<div class="flex gap-1.5">
-						<div class="bg-surface min-w-0 flex-1 truncate rounded-lg border border-white/[0.06] px-2.5 py-1.5 font-mono text-[11px] text-text-secondary">
-							{inviteUrl}
-						</div>
-						<button
-							onclick={copyInvite}
-							class="flex-shrink-0 cursor-pointer rounded-lg px-3 py-1.5 text-[12px] font-semibold text-white transition-all duration-150 {copied
-								? 'bg-green-600'
-								: 'bg-accent hover:bg-accent-hover'}"
-						>
-							{copied ? 'Copied!' : 'Copy'}
-						</button>
+			{#if showNudge}
+				<button
+					onclick={() => { nudgeDismissed = true; inviteOpen = true; copyInvite(); }}
+					class="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 z-10 cursor-pointer whitespace-nowrap rounded-lg bg-white px-3 py-1.5 text-[13px] font-medium text-gray-900 shadow-lg transition-all duration-150 hover:bg-gray-100 active:scale-95"
+				>
+					Invite someone to join
+					<div class="absolute left-1/2 -translate-x-1/2 top-full w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[6px] border-t-white"></div>
+				</button>
+			{/if}
+
+		{#if inviteOpen}
+			<div class="fixed sm:absolute bottom-full left-2 right-2 sm:left-1/2 mb-3 sm:w-80 sm:-translate-x-1/2 sm:right-auto rounded-xl border border-white/[0.08] bg-[#18181b]/98 p-3.5 shadow-2xl backdrop-blur-xl sm:bottom-full bottom-16">
+				<!-- AI Agents section -->
+				<div class="mb-3">
+					<div class="mb-2.5 text-[12px] font-semibold uppercase tracking-wider text-text-muted">AI Agents</div>
+					<div class="flex gap-2">
+						{#each personas as persona, i}
+							{@const isActive = activeAgents.has(persona.slug)}
+							{@const isLoading = loadingAgents.has(persona.slug)}
+							<button
+								onclick={() => {
+									if (isLoading) return;
+									if (isActive) onRemoveAgent?.(persona.slug);
+									else onAddAgent?.(persona.slug);
+								}}
+								class="group flex flex-1 flex-col items-center gap-1.5 rounded-xl border p-2 transition-all duration-200 cursor-pointer
+									{isActive
+										? 'border-accent/30 bg-accent/[0.06]'
+										: isLoading
+											? 'border-white/[0.08] bg-white/[0.02] opacity-70'
+											: 'border-white/[0.06] bg-white/[0.02] hover:border-white/[0.12] hover:bg-white/[0.04] hover:scale-[1.03]'}"
+								style="animation-delay: {i * 50}ms"
+								disabled={isLoading}
+							>
+							<div class="relative h-12 w-12 overflow-hidden rounded-full ring-2 transition-all duration-200 {isActive ? 'ring-green-400/60' : isLoading ? 'ring-white/[0.1]' : 'ring-white/[0.1] group-hover:ring-white/[0.2]'}">
+								<img
+									src={persona.avatarUrl}
+									alt={persona.name}
+									class="h-full w-full object-cover"
+								/>
+								{#if isLoading}
+									<div class="absolute inset-0 flex items-center justify-center bg-black/40">
+										<svg class="h-4 w-4 animate-spin text-white" viewBox="0 0 24 24" fill="none">
+											<circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>
+											<path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+										</svg>
+									</div>
+								{/if}
+							</div>
+							<div class="text-center">
+								<div class="text-[13px] font-semibold text-text-primary leading-tight">{persona.name.split(' ').pop()}</div>
+								<div class="text-[11px] text-text-muted leading-tight">{persona.tagline}</div>
+							</div>
+							<div class="text-[12px] font-medium {isActive ? 'text-red-400 group-hover:text-red-300' : isLoading ? 'text-text-muted' : 'text-accent'}">
+								{isActive ? 'Disconnect' : isLoading ? 'Adding...' : '+ Add'}
+							</div>
+							</button>
+						{/each}
 					</div>
 				</div>
-			{/if}
+
+				<!-- Divider -->
+				<div class="flex items-center gap-2 mb-3">
+					<div class="flex-1 h-px bg-white/[0.06]"></div>
+					<span class="text-[11px] text-text-muted">or invite someone</span>
+					<div class="flex-1 h-px bg-white/[0.06]"></div>
+				</div>
+
+				<!-- Link invite -->
+				<div class="flex gap-1.5">
+					<div class="bg-surface min-w-0 flex-1 truncate rounded-lg border border-white/[0.06] px-2.5 py-1.5 font-mono text-[11px] text-text-secondary">
+						{inviteUrl}
+					</div>
+					<button
+						onclick={copyInvite}
+						class="flex-shrink-0 cursor-pointer rounded-lg px-3 py-1.5 text-[12px] font-semibold text-white transition-all duration-150 {copied
+							? 'bg-green-600'
+							: 'bg-accent hover:bg-accent-hover'}"
+					>
+						{copied ? 'Copied!' : 'Copy'}
+					</button>
+				</div>
+			</div>
+		{/if}
 		</div>
 
 		<!-- Chat -->
@@ -349,6 +416,49 @@
 	</div>
 </div>
 
+{#snippet mediaControl(opts: {
+	enabled: boolean;
+	onToggle: () => void;
+	iconOn: string;
+	iconOff: string;
+	titleOn: string;
+	titleOff: string;
+	devices: DeviceInfo[];
+	selectedDevice: string;
+	onSwitchDevice?: (id: string) => void;
+	menuLabel: string;
+	menuOpen: boolean;
+	onMenuToggle: () => void;
+})}
+	{@const hasMultiple = opts.devices.length > 1}
+	<div
+		class="relative flex items-stretch"
+		data-device-menu
+		onmouseenter={() => { if (hasMultiple) { clearTimeout(hoverTimer); hoverTimer = setTimeout(() => { closeAllMenus(); opts.onMenuToggle(); }, 400); } }}
+		onmouseleave={() => { clearTimeout(hoverTimer); if (opts.menuOpen) { hoverTimer = setTimeout(() => { if (opts.menuOpen) opts.onMenuToggle(); }, 300); } }}
+	>
+		<button
+			onclick={(e) => { if (!longPressed) opts.onToggle(); longPressed = false; }}
+			oncontextmenu={(e) => { if (hasMultiple) { e.preventDefault(); closeAllMenus(); opts.onMenuToggle(); } }}
+			onpointerdown={(e) => {
+				if (!hasMultiple || e.pointerType === 'mouse') return;
+				longPressed = false;
+				pressTimer = setTimeout(() => { longPressed = true; closeAllMenus(); opts.onMenuToggle(); }, 500);
+			}}
+			onpointerup={() => { clearTimeout(pressTimer); }}
+			onpointercancel={() => { clearTimeout(pressTimer); }}
+			class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-xl transition-all duration-150 active:scale-90
+				{!opts.enabled ? 'bg-danger/15 text-danger hover:bg-danger/25' : 'text-text-secondary hover:bg-white/[0.06] hover:text-text-primary'}"
+			title={opts.enabled ? opts.titleOn : opts.titleOff}
+		>
+			{@render icon(opts.enabled ? opts.iconOn : opts.iconOff)}
+		</button>
+		{#if opts.menuOpen}
+			{@render deviceMenu(opts.devices, opts.selectedDevice, (id) => { opts.onSwitchDevice?.(id); opts.onMenuToggle(); }, opts.menuLabel)}
+		{/if}
+	</div>
+{/snippet}
+
 {#snippet icon(name: string)}
 	<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 		{#if name === 'mic'}
@@ -363,6 +473,8 @@
 			<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>
 		{:else if name === 'speaker'}
 			<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+		{:else if name === 'speaker-off'}
+			<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/>
 		{:else if name === 'invite'}
 			<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>
 		{:else if name === 'chat'}
@@ -372,7 +484,7 @@
 {/snippet}
 
 {#snippet deviceMenu(devices: DeviceInfo[], selectedId: string, onSelect: (id: string) => void, title: string)}
-	<div class="fixed sm:absolute bottom-16 sm:bottom-full left-2 right-2 sm:left-1/2 sm:right-auto sm:mb-2 sm:w-64 sm:-translate-x-1/2 rounded-xl border border-white/[0.08] bg-[#18181b]/98 p-1.5 shadow-2xl backdrop-blur-xl">
+	<div class="fixed sm:absolute bottom-16 sm:bottom-full left-2 right-2 sm:left-1/2 sm:right-auto sm:mb-2 sm:w-64 sm:-translate-x-1/2 z-20 rounded-xl border border-white/[0.08] bg-[#18181b]/98 p-1.5 shadow-2xl backdrop-blur-xl">
 		<div class="px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-text-muted">{title}</div>
 		{#each devices as device (device.deviceId)}
 			<button

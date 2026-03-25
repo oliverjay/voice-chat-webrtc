@@ -6,7 +6,8 @@ const KEYS = {
 	mic: `${PREFIX}mic`,
 	speaker: `${PREFIX}speaker`,
 	videoEnabled: `${PREFIX}videoEnabled`,
-	audioEnabled: `${PREFIX}audioEnabled`
+	audioEnabled: `${PREFIX}audioEnabled`,
+	speakerMuted: `${PREFIX}speakerMuted`
 } as const;
 
 function get(key: string): string | null {
@@ -30,7 +31,8 @@ export function loadPreferences() {
 		mic: get(KEYS.mic) || '',
 		speaker: get(KEYS.speaker) || '',
 		videoEnabled: get(KEYS.videoEnabled) !== 'false',
-		audioEnabled: get(KEYS.audioEnabled) !== 'false'
+		audioEnabled: get(KEYS.audioEnabled) !== 'false',
+		speakerMuted: get(KEYS.speakerMuted) === 'true'
 	};
 }
 
@@ -56,6 +58,10 @@ export function saveVideoEnabled(enabled: boolean) {
 
 export function saveAudioEnabled(enabled: boolean) {
 	set(KEYS.audioEnabled, String(enabled));
+}
+
+export function saveSpeakerMuted(muted: boolean) {
+	set(KEYS.speakerMuted, String(muted));
 }
 
 export function getClientId(): string {

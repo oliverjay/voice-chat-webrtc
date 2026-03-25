@@ -12,11 +12,12 @@ class RoomStore {
 	socket: RoomSocket | null = null;
 	private messageListeners = new Set<(msg: ServerMessage) => void>();
 	private joinInfo: { name: string; sessionId: string; clientId?: string; audioTrack?: string; videoTrack?: string } | null = null;
+	private lobbyInfo: { clientId: string } | null = null;
 	private pollInterval: ReturnType<typeof setInterval> | null = null;
 
 	connect(roomServerUrl: string, roomId: string) {
 		if (this.socket) {
-			this.socket.disconnect();
+			this.socket.close();
 			this.socket = null;
 		}
 		if (this.pollInterval) {
@@ -43,6 +44,11 @@ class RoomStore {
 					clientId: this.joinInfo.clientId,
 					audioTrack: this.joinInfo.audioTrack,
 					videoTrack: this.joinInfo.videoTrack
+				});
+			} else if (this.lobbyInfo) {
+				this.socket?.send({
+					type: 'lobby',
+					clientId: this.lobbyInfo.clientId
 				});
 			}
 		});
@@ -73,7 +79,15 @@ class RoomStore {
 		return () => this.messageListeners.delete(listener);
 	}
 
+	lobbyJoin(clientId: string) {
+		this.lobbyInfo = { clientId };
+		if (this.socket?.connected) {
+			this.socket.send({ type: 'lobby', clientId });
+		}
+	}
+
 	join(name: string, sessionId: string, clientId?: string, audioTrack?: string, videoTrack?: string) {
+		this.lobbyInfo = null;
 		this.joinInfo = { name, sessionId, clientId, audioTrack, videoTrack };
 		if (this.socket?.connected) {
 			this.socket.send({ type: 'join', name, sessionId, clientId, audioTrack, videoTrack });
@@ -85,12 +99,29 @@ class RoomStore {
 	}
 
 	sendChat(text: string) {
+		const trimmed = String(text).trim().slice(0, 2000);
+		if (!trimmed) return;
+
+		const self = this.participants.find((p) => p.id === this.myId);
+		const pendingId = `pending-${crypto.randomUUID()}`;
+		this.chatMessages = [
+			...this.chatMessages,
+			{
+				id: pendingId,
+				participantId: this.myId,
+				name: self?.name ?? 'You',
+				text: trimmed,
+				timestamp: Date.now()
+			}
+		];
+
 		if (!this.socket?.connected) {
-			console.warn('[Room] sendChat failed: socket not connected');
+			console.warn('[Room] sendChat: socket not connected — message shown locally only until reconnect');
 			return;
 		}
-		console.log('[Room] sending chat:', text);
-		this.socket.send({ type: 'chat', text });
+
+		console.log('[Room] sending chat:', trimmed);
+		this.socket.send({ type: 'chat', text: trimmed });
 	}
 
 	addClip(clip: PreBriefClip) {
@@ -114,6 +145,7 @@ class RoomStore {
 		this.viewStatuses = [];
 		this.myId = '';
 		this.joinInfo = null;
+		this.lobbyInfo = null;
 	}
 
 	get otherParticipants() {
@@ -153,10 +185,25 @@ class RoomStore {
 				break;
 			}
 
-			case 'chat-message':
-				console.log('[Room] received chat-message from', msg.message.name, ':', msg.message.text);
-				this.chatMessages = [...this.chatMessages, msg.message];
+			case 'chat-message': {
+				const incoming = msg.message;
+				let removedPending = false;
+				this.chatMessages = this.chatMessages.filter((m) => {
+					if (
+						!removedPending &&
+						m.id.startsWith('pending-') &&
+						m.participantId === incoming.participantId &&
+						m.text === incoming.text
+					) {
+						removedPending = true;
+						return false;
+					}
+					return true;
+				});
+				this.chatMessages = [...this.chatMessages, incoming];
+				console.log('[Room] received chat-message from', incoming.name, ':', incoming.text);
 				break;
+			}
 
 			case 'clip-added':
 				this.clips = [...this.clips, msg.clip];
@@ -178,6 +225,11 @@ class RoomStore {
 				}
 				break;
 			}
+
+			case 'agent-joined-ack':
+			case 'agent-typing':
+			case 'agent-done':
+				break;
 
 			case 'error':
 				console.error('[Room] Server error:', msg.message);

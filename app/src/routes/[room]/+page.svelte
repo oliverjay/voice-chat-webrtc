@@ -7,10 +7,12 @@
 	import { room } from '$lib/stores/room.svelte';
 	import { loadPreferences, saveName, getClientId } from '$lib/utils/preferences';
 	import { playTestTone } from '$lib/utils/devices';
+	import { generateRandomName } from '$lib/utils/names';
 	import PreBriefTimeline from '$lib/components/PreBriefTimeline.svelte';
 	import type { PreBriefClip } from '$lib/room/protocol';
 
 	let name = $state('');
+	let isRandomName = $state(false);
 	let joining = $state(false);
 	let videoEl: HTMLVideoElement;
 	let audioLevel = $state(0);
@@ -20,7 +22,10 @@
 	let micDropdown = $state(false);
 	let camDropdown = $state(false);
 	let spkDropdown = $state(false);
-	let peekNames = $state<string[]>([]);
+	let longPressed = false;
+	let pressTimer: ReturnType<typeof setTimeout>;
+	let hoverTimer: ReturnType<typeof setTimeout>;
+	let peekParticipants = $state<{ name: string; isAgent: boolean; avatarUrl: string }[]>([]);
 	let peekClipCount = $state(0);
 	let peekWs: WebSocket | null = null;
 	let roomConnected = $state(false);
@@ -100,9 +105,9 @@
 				try {
 					const msg = JSON.parse(e.data);
 					if (msg.type === 'peek-result') {
-						peekNames = msg.participants.map((p: { name: string }) => p.name);
+						peekParticipants = msg.participants.map((p: any) => ({ name: p.name || '', isAgent: !!p.isAgent, avatarUrl: p.avatarUrl || '' }));
 						peekClipCount = msg.clipCount ?? 0;
-						console.log('[PreJoin] Peek result:', peekNames, 'clips:', peekClipCount);
+						console.log('[PreJoin] Peek result:', peekParticipants, 'clips:', peekClipCount);
 						peekWs?.close();
 						peekWs = null;
 					}
@@ -123,12 +128,12 @@
 		if (roomConnected || !roomId) return;
 		const wsUrl = getRoomServerUrl();
 		room.connect(wsUrl, roomId);
-		room.join(name || 'Anonymous', '', clientId);
+		room.lobbyJoin(clientId);
 		roomConnected = true;
 	}
 
 	function handleWatchProgress(clipId: string, progress: number) {
-		room.reportClipWatched(clipId, clientId, name || 'Anonymous', progress);
+		room.reportClipWatched(clipId, clientId, name, progress);
 	}
 
 	function handleDeleteClip(clipId: string) {
@@ -137,7 +142,13 @@
 
 	onMount(async () => {
 		const prefs = loadPreferences();
-		name = prefs.name;
+		if (prefs.name) {
+			name = prefs.name;
+			isRandomName = false;
+		} else {
+			name = generateRandomName();
+			isRandomName = true;
+		}
 
 		peekRoom();
 
@@ -149,14 +160,13 @@
 			setupMicAnalyser(media.stream);
 		}
 
-		nameInput?.focus();
+		if (!isRandomName) nameInput?.focus();
 
 		connectRoom();
 	});
 
 	onDestroy(() => {
 		cleanupMicAnalyser();
-		room.disconnect();
 		if (peekWs) {
 			peekWs.onmessage = null;
 			peekWs.close();
@@ -194,12 +204,19 @@
 	function handleNameInput(e: Event) {
 		const val = (e.target as HTMLInputElement).value;
 		name = val;
+		isRandomName = false;
 		saveName(val);
+	}
+
+	function rerollName() {
+		name = generateRandomName();
+		isRandomName = true;
 	}
 
 	async function joinCall() {
 		if (!name.trim()) return;
 		saveName(name.trim());
+		isRandomName = false;
 		joining = true;
 		goto(`/${roomId}/call`);
 	}
@@ -254,10 +271,9 @@
 			</div>
 
 			<!-- Device Controls -->
-			<div class="flex w-full flex-col gap-1.5">
-				{@render deviceRow({
+			<div class="grid w-full grid-cols-3 gap-1.5">
+				{@render deviceBtn({
 					icon: media.audioEnabled ? 'mic' : 'mic-off',
-					label: media.mics.find(m => m.deviceId === media.selectedMic)?.label || 'Microphone',
 					active: media.audioEnabled,
 					onToggle: () => media.toggleAudio(),
 					devices: media.mics,
@@ -266,12 +282,11 @@
 					dropdownOpen: micDropdown,
 					onDropdownToggle: () => { micDropdown = !micDropdown; camDropdown = false; spkDropdown = false; },
 					level: media.audioEnabled ? audioLevel : 0,
-					levelColor: 'green'
+					title: 'Microphone',
 				})}
 
-				{@render deviceRow({
+				{@render deviceBtn({
 					icon: media.videoEnabled ? 'cam' : 'cam-off',
-					label: media.cameras.find(c => c.deviceId === media.selectedCamera)?.label || 'Camera',
 					active: media.videoEnabled,
 					onToggle: () => media.toggleVideo(),
 					devices: media.cameras,
@@ -280,24 +295,21 @@
 					dropdownOpen: camDropdown,
 					onDropdownToggle: () => { camDropdown = !camDropdown; micDropdown = false; spkDropdown = false; },
 					level: 0,
-					levelColor: 'green'
+					title: 'Camera',
 				})}
 
-				{#if media.speakers.length > 0}
-					{@render deviceRow({
-						icon: 'speaker',
-						label: media.speakers.find(s => s.deviceId === media.selectedSpeaker)?.label || 'Speaker',
-						active: true,
-						onToggle: testSpeaker,
-						devices: media.speakers,
-						selectedDevice: media.selectedSpeaker,
-						onSelect: (id) => { media.switchSpeaker(id); spkDropdown = false; },
-						dropdownOpen: spkDropdown,
-						onDropdownToggle: () => { spkDropdown = !spkDropdown; micDropdown = false; camDropdown = false; },
-						level: speakerLevel,
-						levelColor: 'accent'
-					})}
-				{/if}
+				{@render deviceBtn({
+					icon: 'speaker',
+					active: true,
+					onToggle: testSpeaker,
+					devices: media.speakers,
+					selectedDevice: media.selectedSpeaker,
+					onSelect: (id) => { media.switchSpeaker(id); spkDropdown = false; },
+					dropdownOpen: spkDropdown,
+					onDropdownToggle: () => { spkDropdown = !spkDropdown; micDropdown = false; camDropdown = false; },
+					level: speakerLevel,
+					title: 'Speaker',
+				})}
 			</div>
 		</div>
 
@@ -305,28 +317,36 @@
 		<div class="flex flex-col justify-center gap-4 sm:gap-5">
 			<div>
 				<h1 class="text-2xl font-bold tracking-tight">Ready to join?</h1>
-				{#if peekNames.length > 0}
-					<div class="mt-2.5 flex items-center gap-2.5">
-						<div class="flex -space-x-2">
-							{#each peekNames.slice(0, 5) as pName}
-								<div class="flex h-7 w-7 items-center justify-center rounded-full bg-accent/20 text-[11px] font-semibold text-accent ring-2 ring-base">
-									{pName[0]?.toUpperCase() || '?'}
-								</div>
-							{/each}
-						</div>
-						<span class="text-[13px] text-text-secondary leading-tight">
-							{#if peekNames.length === 1}
-								<span class="text-text-primary font-medium">{peekNames[0]}</span> is in the call
-							{:else if peekNames.length === 2}
-								<span class="text-text-primary font-medium">{peekNames[0]}</span> and <span class="text-text-primary font-medium">{peekNames[1]}</span> are in the call
+			{#if peekParticipants.length > 0}
+				<div class="mt-2.5 flex items-center gap-2.5">
+					<div class="flex -space-x-2">
+						{#each peekParticipants.slice(0, 5) as p}
+							{#if p.isAgent && p.avatarUrl}
+								<img
+									src={p.avatarUrl}
+									alt={p.name}
+									class="h-7 w-7 rounded-full object-cover ring-2 ring-base"
+								/>
 							{:else}
-								<span class="text-text-primary font-medium">{peekNames[0]}</span>, <span class="text-text-primary font-medium">{peekNames[1]}</span> + {peekNames.length - 2} more
+								<div class="flex h-7 w-7 items-center justify-center rounded-full bg-accent/20 text-[11px] font-semibold text-accent ring-2 ring-base">
+									{p.name[0]?.toUpperCase() || '?'}
+								</div>
 							{/if}
-						</span>
+						{/each}
 					</div>
-				{:else}
-					<p class="mt-1.5 text-[13px] text-text-muted">No one else is here yet</p>
-				{/if}
+					<span class="text-[13px] text-text-secondary leading-tight">
+						{#if peekParticipants.length === 1}
+							<span class="text-text-primary font-medium">{peekParticipants[0].name}</span> is in the call
+						{:else if peekParticipants.length === 2}
+							<span class="text-text-primary font-medium">{peekParticipants[0].name}</span> and <span class="text-text-primary font-medium">{peekParticipants[1].name}</span> are in the call
+						{:else}
+							<span class="text-text-primary font-medium">{peekParticipants[0].name}</span>, <span class="text-text-primary font-medium">{peekParticipants[1].name}</span> + {peekParticipants.length - 2} more
+						{/if}
+					</span>
+				</div>
+			{:else}
+				<p class="mt-1.5 text-[13px] text-text-muted">No one else is here yet</p>
+			{/if}
 			</div>
 
 			<!-- Pre-Brief Timeline -->
@@ -376,15 +396,27 @@
 			</button>
 
 			<div class="space-y-3">
-				<input
-					bind:this={nameInput}
-					bind:value={name}
-					oninput={handleNameInput}
-					placeholder="Your name"
-					maxlength="50"
-					class="bg-surface text-text-primary placeholder-text-muted w-full rounded-xl border border-white/5 px-4 py-3 text-base outline-none transition-colors focus:border-accent/60 focus:ring-1 focus:ring-accent/20"
-					onkeydown={(e) => e.key === 'Enter' && joinCall()}
-				/>
+				<div class="relative">
+					<input
+						bind:this={nameInput}
+						bind:value={name}
+						oninput={handleNameInput}
+						placeholder="Your name"
+						maxlength="50"
+						class="bg-surface text-text-primary placeholder-text-muted w-full rounded-xl border border-white/5 px-4 py-3 text-base outline-none transition-colors focus:border-accent/60 focus:ring-1 focus:ring-accent/20 {isRandomName ? 'text-text-secondary italic' : ''}"
+						onfocus={() => { if (isRandomName) { name = ''; isRandomName = false; } }}
+						onkeydown={(e) => e.key === 'Enter' && joinCall()}
+					/>
+					{#if isRandomName}
+						<button
+							onclick={rerollName}
+							class="absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer rounded-lg p-1.5 text-text-muted transition-colors hover:bg-white/[0.06] hover:text-text-primary"
+							title="Generate new name"
+						>
+							<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+						</button>
+					{/if}
+				</div>
 
 				<button
 					onclick={joinCall}
@@ -398,9 +430,8 @@
 	</div>
 </div>
 
-{#snippet deviceRow(props: {
+{#snippet deviceBtn(props: {
 	icon: string;
-	label: string;
 	active: boolean;
 	onToggle: () => void;
 	devices: import('$lib/utils/devices').DeviceInfo[];
@@ -409,54 +440,57 @@
 	dropdownOpen: boolean;
 	onDropdownToggle: () => void;
 	level: number;
-	levelColor: string;
+	title: string;
 })}
-	<div class="relative" data-dropdown>
-		<div class="flex items-stretch overflow-hidden rounded-xl border border-white/[0.06] {props.active ? 'bg-surface' : 'bg-danger/10 border-danger/20'}">
+	{@const hasMultiple = props.devices.length > 1}
+	<div
+		class="relative"
+		data-dropdown
+		onmouseenter={() => { if (hasMultiple) { clearTimeout(hoverTimer); hoverTimer = setTimeout(() => { closeAllDropdowns(); props.onDropdownToggle(); }, 400); } }}
+		onmouseleave={() => { clearTimeout(hoverTimer); if (props.dropdownOpen) { hoverTimer = setTimeout(() => { if (props.dropdownOpen) props.onDropdownToggle(); }, 300); } }}
+	>
+		<div class="overflow-hidden rounded-xl border border-white/[0.06] {props.active ? 'bg-surface' : 'bg-danger/10 border-danger/20'}">
 			<button
-				onclick={props.onToggle}
-				class="flex flex-1 cursor-pointer items-center gap-2.5 px-3.5 py-2.5 text-[13px] transition-colors hover:bg-white/[0.04] {props.active ? 'text-text-primary' : 'text-danger'}"
+				onclick={() => { if (!longPressed) props.onToggle(); longPressed = false; }}
+				oncontextmenu={(e) => { if (hasMultiple) { e.preventDefault(); closeAllDropdowns(); props.onDropdownToggle(); } }}
+				onpointerdown={(e) => {
+					if (!hasMultiple || e.pointerType === 'mouse') return;
+					longPressed = false;
+					pressTimer = setTimeout(() => { longPressed = true; closeAllDropdowns(); props.onDropdownToggle(); }, 500);
+				}}
+				onpointerup={() => { clearTimeout(pressTimer); }}
+				onpointercancel={() => { clearTimeout(pressTimer); }}
+				class="relative flex w-full cursor-pointer items-center justify-center py-3 transition-colors hover:bg-white/[0.04] {props.active ? 'text-text-secondary' : 'text-danger'}"
+				title={props.title}
 			>
-				<span class="flex h-5 w-5 shrink-0 items-center justify-center {props.active ? 'text-text-secondary' : 'text-danger/70'}">
-					{#if props.icon === 'mic'}
-						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
-					{:else if props.icon === 'mic-off'}
-						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" x2="22" y1="2" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 0"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
-					{:else if props.icon === 'cam'}
-						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg>
-					{:else if props.icon === 'cam-off'}
-						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196"/><path d="M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
-					{:else}
-						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-					{/if}
-				</span>
-				<span class="min-w-0 flex-1 truncate">{props.label}</span>
-				{#if props.level > 0}
-					<div class="ml-1 flex h-3.5 items-end gap-[2px]">
-						{#each Array(5) as _, i}
-							<div
-								class="w-[3px] rounded-full transition-all duration-100 {props.level > i * 0.2 ? (props.levelColor === 'green' ? 'bg-green-400' : 'bg-accent') : 'bg-white/[0.08]'}"
-								style="height: {2 + i * 2}px"
-							></div>
-						{/each}
+				{#if props.icon === 'mic'}
+					<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+				{:else if props.icon === 'mic-off'}
+					<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="2" x2="22" y1="2" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 0"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+				{:else if props.icon === 'cam'}
+					<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg>
+				{:else if props.icon === 'cam-off'}
+					<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196"/><path d="M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
+				{:else}
+					<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+				{/if}
+				{#if props.level > 0.02}
+					<div class="absolute inset-x-0 bottom-0 h-[3px] overflow-hidden rounded-b-xl">
+						<div
+							class="h-full rounded-full bg-green-400/80 transition-all duration-75"
+							style="width: {Math.min(props.level, 1) * 100}%"
+						></div>
 					</div>
 				{/if}
 			</button>
-			{#if props.devices.length > 1}
-				<button
-					onclick={props.onDropdownToggle}
-					class="flex cursor-pointer items-center border-l border-white/[0.06] px-2.5 text-text-muted transition-colors hover:bg-white/[0.04] hover:text-text-primary {props.dropdownOpen ? 'bg-white/[0.04] text-text-primary' : ''}"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-				</button>
-			{/if}
 		</div>
 		{#if props.dropdownOpen}
-			<div class="absolute left-0 top-full z-30 mt-1.5 w-full rounded-xl border border-white/10 bg-[#18181b]/98 p-1 shadow-2xl backdrop-blur-xl">
+			<div class="absolute left-0 top-full z-30 mt-1.5 min-w-48 rounded-xl border border-white/10 bg-[#18181b]/98 p-1 shadow-2xl backdrop-blur-xl">
+				<div class="px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-text-muted">{props.title}</div>
 				{#each props.devices as device (device.deviceId)}
 					<button
 						onclick={() => props.onSelect(device.deviceId)}
-						class="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] transition-colors hover:bg-white/[0.06] {device.deviceId === props.selectedDevice ? 'text-accent' : 'text-text-secondary'}"
+						class="flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors hover:bg-white/[0.06] {device.deviceId === props.selectedDevice ? 'text-accent' : 'text-text-secondary'}"
 					>
 						{#if device.deviceId === props.selectedDevice}
 							<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>

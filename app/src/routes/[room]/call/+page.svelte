@@ -6,6 +6,7 @@
 	import { media } from '$lib/stores/media.svelte';
 	import { room } from '$lib/stores/room.svelte';
 	import { loadPreferences, getClientId } from '$lib/utils/preferences';
+	import { generateRandomName } from '$lib/utils/names';
 	import VideoTile from '$lib/components/VideoTile.svelte';
 	import ControlBar from '$lib/components/ControlBar.svelte';
 	import ChatPanel from '$lib/components/ChatPanel.svelte';
@@ -17,9 +18,121 @@
 		closeTracks,
 		createPeerConnection,
 		getConnectionQuality,
-		enableOpusDtxInSdp
+		enableOpusDtxInSdp,
+		updateTrackSimulcast,
+		type SimulcastPrefs
 	} from '$lib/webrtc/session';
 	import type { Participant, ServerMessage } from '$lib/room/protocol';
+	import { AgentManager, type AgentState } from '$lib/agents/agent-manager';
+	import { personas, getPersona } from '$lib/agents/personas';
+	import { wakeDirectPrompt } from '$lib/agents/wake';
+	import { stopActiveSpeechRecognition } from '$lib/utils/speech-recognition';
+
+	const agentManager = new AgentManager();
+	let agentStates = $state<Map<string, AgentState>>(new Map());
+	let activeAgentSlugs = $state<Set<string>>(new Set());
+	let loadingAgents = $state<Set<string>>(new Set());
+	let agentTypingIds = $state<Set<string>>(new Set());
+	let recentlyJoinedAgents = $state<Set<string>>(new Set());
+	const rehydratingAgents = new Set<string>();
+
+	let agentParticipantIds = $derived(() => {
+		const ids = new Set<string>();
+		for (const p of room.participants) {
+			if (p.isAgent) ids.add(p.id);
+		}
+		return ids;
+	});
+
+	let agentNames = $derived(() => {
+		const map = new Map<string, string>();
+		for (const p of room.participants) {
+			if (p.isAgent) map.set(p.id, p.name);
+		}
+		return map;
+	});
+
+	let agentWakeTimer: ReturnType<typeof setTimeout> | null = null;
+	let pendingWakeOnReady: { slug: string; prompt: string } | null = null;
+
+	function evaluateAgentWake() {
+		const msgs = room.chatMessages;
+		const allKnownSlugs = new Set([...activeAgentSlugs, ...loadingAgents, ...rehydratingAgents]);
+		if (msgs.length === 0 || allKnownSlugs.size === 0) return;
+
+		const agentIds = agentParticipantIds();
+
+		// Find the last human message — the debounce was triggered by a human chat-message,
+		// but an agent response may have arrived during the delay.
+		let lastHumanIdx = msgs.length - 1;
+		while (lastHumanIdx >= 0 && agentIds.has(msgs[lastHumanIdx].participantId)) {
+			lastHumanIdx--;
+		}
+		if (lastHumanIdx < 0) return;
+
+		// Collect all human messages in the most recent unbroken human run
+		// (scan backwards from lastHumanIdx, stopping at any agent message).
+		let burstStart = lastHumanIdx;
+		while (burstStart > 0 && !agentIds.has(msgs[burstStart - 1].participantId)) {
+			burstStart--;
+		}
+		const humanBurst = msgs.slice(burstStart, lastHumanIdx + 1);
+		if (humanBurst.length === 0) return;
+
+		const burstCombined = humanBurst.map(x => x.text).join('\n');
+		const lastHumanText = humanBurst[humanBurst.length - 1].text;
+
+		// 1. Direct wake: check if any agent is addressed by name (fuzzy).
+		//    If multiple agents are named, trigger all of them.
+		let wakeTriggered = false;
+		for (const slug of allKnownSlugs) {
+			const persona = getPersona(slug);
+			if (!persona) continue;
+
+			const direct = wakeDirectPrompt(burstCombined, persona) ?? wakeDirectPrompt(lastHumanText, persona);
+			if (direct !== null) {
+				wakeTriggered = true;
+				if (activeAgentSlugs.has(slug)) {
+					console.log('[Call] Wake prompt for', persona.name, ':', direct.slice(0, 120));
+					void agentManager.triggerResponse(slug, room.chatMessages, agentIds, false, {
+						lastMessageOverride: direct
+					});
+				} else {
+					console.log('[Call] Wake queued for loading agent', persona.name, ':', direct.slice(0, 120));
+					pendingWakeOnReady = { slug, prompt: direct };
+				}
+			}
+		}
+		if (wakeTriggered) return;
+
+		// 2. Follow-up: find the most recent agent message before the human burst.
+		//    This is a conversational continuation (user replying to the agent without re-naming it).
+		for (let i = burstStart - 1; i >= 0; i--) {
+			const prev = msgs[i];
+			if (agentIds.has(prev.participantId)) {
+				const agent = agentManager.getAgentByParticipantId(prev.participantId);
+				if (agent) {
+					console.log('[Call] Agent follow-up for', agent.persona.name, ':', burstCombined.slice(0, 120));
+					void agentManager.triggerResponse(agent.persona.slug, room.chatMessages, agentIds, false);
+				}
+				return;
+			}
+		}
+	}
+
+	agentManager.setOnStateChange((slug, state) => {
+		agentStates = new Map(agentStates.set(slug, state));
+	});
+
+	function getAgentStateForParticipant(p: Participant): AgentState {
+		if (!p.isAgent) return 'idle';
+		for (const [slug, agent] of [...activeAgentSlugs].map(s => [s, agentManager.getAgent(s)] as const)) {
+			if (agent && agent.participantId === p.id) {
+				return agentStates.get(slug) ?? 'idle';
+			}
+		}
+		return 'idle';
+	}
 
 	function getRoomServerUrl() {
 		if (!browser) return 'ws://localhost:8787';
@@ -35,7 +148,7 @@
 	const clientId = browser ? getClientId() : '';
 
 	if (browser) {
-		userName = loadPreferences().name || 'Anonymous';
+		userName = loadPreferences().name || generateRandomName();
 	}
 
 	let chatOpen = $state(false);
@@ -72,12 +185,19 @@
 	let negotiationQueue: Array<() => Promise<void>> = [];
 	let negotiating = false;
 
+	const SIMULCAST_HIGH: SimulcastPrefs = { preferredRid: 'h', priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' };
+	const SIMULCAST_LOW: SimulcastPrefs = { preferredRid: 'l', priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' };
+	let videoTrackMids = new Map<string, { mid: string; pSessionId: string; trackName: string }>();
+	let currentSimulcastLayer = new Map<string, string>();
+
 	let activeSpeakerId = $state<string>('');
 	let pinnedId = $state<string>('');
 	let speakerLevels = new Map<string, number>();
 	let speakerCandidate = '';
 	let speakerCandidateStart = 0;
-	let speakerAnalysers = new Map<string, { ctx: AudioContext; analyser: AnalyserNode; data: Float32Array<ArrayBuffer> }>();
+
+	let sharedAudioCtx: AudioContext | null = null;
+	let speakerSources = new Map<string, { source: MediaStreamAudioSourceNode; analyser: AnalyserNode; data: Float32Array<ArrayBuffer> }>();
 	let speakerRafId: number | null = null;
 
 	let connectionQuality = $state<'good' | 'fair' | 'poor' | 'unknown'>('unknown');
@@ -309,6 +429,13 @@
 
 	const SPEAKER_SWITCH_MS = 800;
 
+	function ensureSharedAudioCtx(): AudioContext {
+		if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+			sharedAudioCtx = new AudioContext();
+		}
+		return sharedAudioCtx;
+	}
+
 	function setupSpeakerDetection() {
 		if (speakerRafId !== null) return;
 
@@ -317,7 +444,7 @@
 			let loudestId = '';
 			let loudestLevel = 0;
 
-			for (const [pid, info] of speakerAnalysers) {
+			for (const [pid, info] of speakerSources) {
 				info.analyser.getFloatTimeDomainData(info.data);
 				let sum = 0;
 				for (let i = 0; i < info.data.length; i++) sum += info.data[i] * info.data[i];
@@ -351,23 +478,23 @@
 	}
 
 	function updateSpeakerAnalyser(participantId: string, stream: MediaStream | undefined) {
-		const existing = speakerAnalysers.get(participantId);
+		const existing = speakerSources.get(participantId);
 		if (existing) {
-			existing.ctx.close().catch(() => {});
-			speakerAnalysers.delete(participantId);
+			try { existing.source.disconnect(); } catch {}
+			speakerSources.delete(participantId);
 		}
 
 		if (!stream || stream.getAudioTracks().length === 0) return;
 
 		try {
-			const ctx = new AudioContext();
+			const ctx = ensureSharedAudioCtx();
 			const analyser = ctx.createAnalyser();
 			analyser.fftSize = 1024;
 			analyser.smoothingTimeConstant = 0.5;
 			const source = ctx.createMediaStreamSource(stream);
 			source.connect(analyser);
 			const data = new Float32Array(analyser.fftSize);
-			speakerAnalysers.set(participantId, { ctx, analyser, data });
+			speakerSources.set(participantId, { source, analyser, data });
 			setupSpeakerDetection();
 		} catch (e) {
 			console.warn('[Call] Speaker analyser setup failed for', participantId, e);
@@ -377,27 +504,31 @@
 	function cleanupSpeakerDetection() {
 		if (speakerRafId !== null) cancelAnimationFrame(speakerRafId);
 		speakerRafId = null;
-		for (const [, info] of speakerAnalysers) {
-			info.ctx.close().catch(() => {});
+		for (const [, info] of speakerSources) {
+			try { info.source.disconnect(); } catch {}
 		}
-		speakerAnalysers.clear();
+		speakerSources.clear();
 		speakerLevels.clear();
+		if (sharedAudioCtx) {
+			sharedAudioCtx.close().catch(() => {});
+			sharedAudioCtx = null;
+		}
 	}
 
 	$effect(() => {
 		if (!browser) return;
 		for (const p of room.otherParticipants) {
 			const stream = participantStreams.get(p.id);
-			if (stream && !speakerAnalysers.has(p.id)) {
+			if (stream && !speakerSources.has(p.id)) {
 				updateSpeakerAnalyser(p.id, stream);
 			}
 		}
 		const currentIds = new Set(room.otherParticipants.map(p => p.id));
-		for (const pid of speakerAnalysers.keys()) {
+		for (const pid of speakerSources.keys()) {
 			if (!currentIds.has(pid)) {
-				const info = speakerAnalysers.get(pid);
-				if (info) info.ctx.close().catch(() => {});
-				speakerAnalysers.delete(pid);
+				const info = speakerSources.get(pid);
+				if (info) { try { info.source.disconnect(); } catch {} }
+				speakerSources.delete(pid);
 			}
 		}
 		if (!activeSpeakerId || !currentIds.has(activeSpeakerId)) {
@@ -407,6 +538,8 @@
 			pinnedId = '';
 		}
 	});
+
+	const selfScreenSharing = $derived(media.screenEnabled && !!media.screenStream);
 
 	const screenSharerId = $derived(
 		[...screenStreams.keys()].find(id => room.otherParticipants.some(p => p.id === id)) ?? ''
@@ -425,6 +558,31 @@
 	const thumbnailParticipants = $derived(
 		room.otherParticipants.filter(p => p.id !== focusedId)
 	);
+
+	$effect(() => {
+		if (!browser || !sessionId || !cfCallsAvailable) return;
+		const fid = focusedId;
+		const updates: Array<{ mid: string; sessionId: string; trackName: string; simulcast: SimulcastPrefs }> = [];
+
+		for (const [pid, info] of videoTrackMids) {
+			const wantRid = pid === fid ? 'h' : 'l';
+			const currentRid = currentSimulcastLayer.get(pid);
+			if (currentRid !== wantRid) {
+				currentSimulcastLayer.set(pid, wantRid);
+				updates.push({
+					mid: info.mid,
+					sessionId: info.pSessionId,
+					trackName: info.trackName,
+					simulcast: pid === fid ? SIMULCAST_HIGH : SIMULCAST_LOW
+				});
+			}
+		}
+
+		if (updates.length > 0) {
+			console.log('[Call] Updating simulcast layers:', updates.map(u => `${u.trackName}→${u.simulcast.preferredRid}`));
+			updateTrackSimulcast(sessionId, updates);
+		}
+	});
 
 	$effect(() => {
 		if (browser) {
@@ -459,6 +617,7 @@
 
 	onDestroy(() => {
 		if (iceRestartTimeout) clearTimeout(iceRestartTimeout);
+		if (agentWakeTimer) clearTimeout(agentWakeTimer);
 		stopQualityMonitor();
 		cleanupSpeakerDetection();
 		leaveCall();
@@ -542,9 +701,11 @@
 		pc.ontrack = (e) => {
 			console.log('[Call] Remote track received:', e.track.kind, 'mid:', e.transceiver.mid, 'readyState:', e.track.readyState);
 			rebuildParticipantStreams();
+			requestAnimationFrame(() => media.applySpeakerToElements());
 			e.track.addEventListener('unmute', () => {
 				console.log('[Call] Track unmuted:', e.track.kind, 'mid:', e.transceiver.mid);
 				rebuildParticipantStreams();
+				requestAnimationFrame(() => media.applySpeakerToElements());
 			}, { once: true });
 		};
 
@@ -617,19 +778,36 @@
 	}
 
 	function connectToRoom() {
-		room.connect(ROOM_SERVER_URL, roomId);
-
-		room.join(userName, sessionId, clientId, localAudioTrackName, localVideoTrackName);
-
+		agentManager.setChatContext(
+			() => room.chatMessages,
+			() => agentParticipantIds()
+		);
 		const unsubMsg = room.onMessage(async (msg: ServerMessage) => {
+			console.log('[Call] Room message:', msg.type,
+				msg.type === 'snapshot' ? `(${msg.participants.length} participants, myId=${msg.yourId})` :
+				msg.type === 'participant-joined' ? `(${msg.participant.name})` : '');
 			if (msg.type === 'snapshot') {
+				const others = msg.participants.filter((p: any) => p.id !== msg.yourId);
+				console.log('[Call] Snapshot others:', others.map((p: any) => `${p.name} (session=${p.sessionId?.slice(0,8)}, audio=${p.audioTrack}, video=${p.videoTrack})`));
 				for (const p of msg.participants) {
-					if (p.id !== room.myId) {
+					if (p.id !== room.myId && !p.isAgent) {
+						console.log('[Call] Pulling tracks for snapshot participant:', p.name, { audio: p.audioTrack, video: p.videoTrack, screen: p.screenTrack });
 						await pullParticipantTracks(p);
+					}
+				}
+
+				// Re-hydrate agents that were active before disconnect
+				const serverAgentSlugs = msg.activeAgentSlugs || [];
+				for (const slug of serverAgentSlugs) {
+					if (!activeAgentSlugs.has(slug) && !loadingAgents.has(slug)) {
+						console.log('[Call] Re-hydrating agent:', slug);
+						rehydratingAgents.add(slug);
+						handleAddAgent(slug);
 					}
 				}
 			}
 			if (msg.type === 'participant-joined') {
+				console.log('[Call] New participant:', msg.participant.name, { audio: msg.participant.audioTrack, video: msg.participant.videoTrack });
 				await pullParticipantTracks(msg.participant);
 			}
 			if (msg.type === 'track-updated') {
@@ -660,8 +838,61 @@
 				participantStreams = new Map(participantStreams);
 				screenStreams.delete(msg.participantId);
 				screenStreams = new Map(screenStreams);
+				videoTrackMids.delete(msg.participantId);
+				currentSimulcastLayer.delete(msg.participantId);
+			}
+			if (msg.type === 'agent-joined-ack') {
+				const ackMsg = msg;
+				const pendingSlug = ackMsg.agentSlug || [...loadingAgents].find(slug => {
+					const persona = getPersona(slug);
+					return persona && !activeAgentSlugs.has(slug);
+				});
+				if (pendingSlug) {
+					const isRehydrate = rehydratingAgents.has(pendingSlug);
+					agentManager.setAgentParticipantId(pendingSlug, ackMsg.participantId);
+					activeAgentSlugs = new Set([...activeAgentSlugs, pendingSlug]);
+					loadingAgents = new Set([...loadingAgents].filter(s => s !== pendingSlug));
+					rehydratingAgents.delete(pendingSlug);
+					recentlyJoinedAgents = new Set([...recentlyJoinedAgents, ackMsg.participantId]);
+					setTimeout(() => {
+						recentlyJoinedAgents = new Set([...recentlyJoinedAgents].filter(id => id !== ackMsg.participantId));
+					}, 500);
+
+					await pushAgentAudioTrack(pendingSlug);
+					if (!isRehydrate) {
+						agentManager.triggerResponse(pendingSlug, room.chatMessages, agentParticipantIds(), true);
+					} else if (pendingWakeOnReady?.slug === pendingSlug) {
+						const wake = pendingWakeOnReady;
+						pendingWakeOnReady = null;
+						console.log('[Call] Flushing queued wake for', pendingSlug, ':', wake.prompt.slice(0, 120));
+						void agentManager.triggerResponse(pendingSlug, room.chatMessages, agentParticipantIds(), false, {
+							lastMessageOverride: wake.prompt
+						});
+					}
+				}
+			}
+			if (msg.type === 'agent-typing') {
+				agentTypingIds = new Set([...agentTypingIds, msg.participantId]);
+			}
+			if (msg.type === 'agent-done') {
+				agentTypingIds = new Set([...agentTypingIds].filter(id => id !== msg.participantId));
+			}
+			if (msg.type === 'chat-message') {
+				const m = msg.message;
+				if (agentParticipantIds().has(m.participantId)) return;
+				const anyAgents = activeAgentSlugs.size > 0 || loadingAgents.size > 0 || rehydratingAgents.size > 0;
+				if (!anyAgents) return;
+
+				if (agentWakeTimer) clearTimeout(agentWakeTimer);
+				agentWakeTimer = setTimeout(() => {
+					agentWakeTimer = null;
+					evaluateAgentWake();
+				}, 1500);
 			}
 		});
+
+		room.connect(ROOM_SERVER_URL, roomId);
+		room.join(userName, sessionId, clientId, localAudioTrackName, localVideoTrackName);
 
 		window.addEventListener('beforeunload', handleBeforeUnload);
 
@@ -672,16 +903,23 @@
 		};
 	}
 
+	function getSimulcastForParticipant(pid: string): SimulcastPrefs {
+		const isFocused = focusedId === pid;
+		return isFocused ? SIMULCAST_HIGH : SIMULCAST_LOW;
+	}
+
 	async function pullParticipantTracks(p: Participant) {
 		if (!pc || !sessionId || !cfCallsAvailable) return;
 
-		const tracksToPull: Array<{ sessionId: string; trackName: string }> = [];
+		const tracksToPull: Array<{ sessionId: string; trackName: string; simulcast?: SimulcastPrefs }> = [];
 
 		if (p.audioTrack && !pulledTracks.has(p.audioTrack)) {
 			tracksToPull.push({ sessionId: p.sessionId, trackName: p.audioTrack });
 		}
 		if (p.videoTrack && !pulledTracks.has(p.videoTrack)) {
-			tracksToPull.push({ sessionId: p.sessionId, trackName: p.videoTrack });
+			const simulcast = getSimulcastForParticipant(p.id);
+			tracksToPull.push({ sessionId: p.sessionId, trackName: p.videoTrack, simulcast });
+			currentSimulcastLayer.set(p.id, simulcast.preferredRid);
 		}
 		if (p.screenTrack && !pulledTracks.has(p.screenTrack)) {
 			tracksToPull.push({ sessionId: p.sessionId, trackName: p.screenTrack });
@@ -700,6 +938,9 @@
 					for (const t of pullResult.tracks) {
 						if (t.mid && t.trackName) {
 							pulledTracks = new Map(pulledTracks.set(t.trackName, t.mid));
+							if (p.videoTrack === t.trackName) {
+								videoTrackMids.set(p.id, { mid: t.mid, pSessionId: p.sessionId, trackName: t.trackName });
+							}
 						}
 						if (t.errorCode) {
 							console.error('[Call] Track pull error:', t.trackName, t.errorCode, t.errorDescription);
@@ -737,6 +978,8 @@
 	}
 
 	function leaveCall() {
+		stopActiveSpeechRecognition();
+		agentManager.cleanup();
 		stopQualityMonitor();
 		cleanup?.();
 		room.leave();
@@ -750,32 +993,36 @@
 
 	async function handleLeave() {
 		leaveCall();
-		goto('/');
+		goto(`/${roomId}`);
+	}
+
+	async function cleanupScreenShare() {
+		const screenTrack = media.screenStream?.getVideoTracks()[0];
+		const screenSender = screenTrack && pc
+			? pc.getSenders().find((s) => s.track === screenTrack)
+			: null;
+
+		if (media.screenEnabled) await media.toggleScreen();
+		room.updateTracks(localAudioTrackName, localVideoTrackName, '');
+
+		await enqueueNegotiation(async () => {
+			if (!pc || !sessionId) return;
+			if (localScreenMid) {
+				try {
+					await closeTracks(sessionId, [localScreenMid], true);
+				} catch (e) {
+					console.error('[Call] Failed to close screen track:', e);
+				}
+			}
+			if (screenSender) pc.removeTrack(screenSender);
+			localScreenTrackName = '';
+			localScreenMid = '';
+		});
 	}
 
 	async function handleToggleScreen() {
 		if (media.screenEnabled) {
-			const screenTrack = media.screenStream?.getVideoTracks()[0];
-
-			await media.toggleScreen();
-			room.updateTracks(localAudioTrackName, localVideoTrackName, '');
-
-			await enqueueNegotiation(async () => {
-				if (!pc || !sessionId) return;
-				if (localScreenMid) {
-					try {
-						await closeTracks(sessionId, [localScreenMid], true);
-					} catch (e) {
-						console.error('[Call] Failed to close screen track:', e);
-					}
-				}
-				if (screenTrack) {
-					const sender = pc.getSenders().find((s) => s.track === screenTrack);
-					if (sender) pc.removeTrack(sender);
-				}
-				localScreenTrackName = '';
-				localScreenMid = '';
-			});
+			await cleanupScreenShare();
 			return;
 		}
 
@@ -788,24 +1035,34 @@
 			await enqueueNegotiation(async () => {
 				if (!pc || !sessionId) return;
 
-				pc.addTrack(screenTrack, media.screenStream!);
+				const screenTransceiver = pc.addTransceiver(screenTrack, {
+					direction: 'sendonly',
+					streams: [media.screenStream!]
+				});
 
 				const offer = await pc.createOffer();
 				await pc.setLocalDescription(offer);
 
-				const transceivers = pc.getTransceivers();
-				const screenTransceiver = transceivers.find(
-					(t) => t.sender.track === screenTrack && t.mid
-				);
-
-				if (screenTransceiver?.mid) {
+				if (screenTransceiver.mid) {
 					const trackName = crypto.randomUUID();
 					localScreenTrackName = trackName;
 					localScreenMid = screenTransceiver.mid;
 
-					const pushResult = await pushLocalTracks(sessionId, offer.sdp!, [
+					const allTrackMappings: Array<{ trackName: string; mid: string }> = [
 						{ trackName, mid: screenTransceiver.mid }
-					]);
+					];
+
+					for (const t of pc.getTransceivers()) {
+						if (t === screenTransceiver || !t.sender.track || !t.mid) continue;
+						const existingName =
+							t.sender.track.kind === 'audio' ? localAudioTrackName :
+							t.sender.track.kind === 'video' ? localVideoTrackName : '';
+						if (existingName) {
+							allTrackMappings.push({ trackName: existingName, mid: t.mid });
+						}
+					}
+
+					const pushResult = await pushLocalTracks(sessionId, offer.sdp!, allTrackMappings);
 
 					if (pushResult.sessionDescription) {
 						await pc.setRemoteDescription(
@@ -822,38 +1079,129 @@
 			});
 
 			screenTrack.addEventListener('ended', () => {
-				handleToggleScreen();
+				console.log('[Call] Screen track ended (native stop)');
+				cleanupScreenShare();
 			});
 		}
 	}
 
 	const hasRemotes = $derived(room.otherParticipants.length > 0);
-	let inviteVisible = $state(false);
+	/** Subscribe to room chat in this component so ChatPanel updates when the store changes. */
+	const chatPanelMessages = $derived(room.chatMessages);
 	let controlBarRef: ControlBar;
 
-	function setScreenSrc(el: HTMLVideoElement, stream: MediaStream) {
-		el.srcObject = stream;
-		return {
-			update(newStream: MediaStream) {
-				if (el.srcObject !== newStream) el.srcObject = newStream;
-			},
-			destroy() {
-				el.srcObject = null;
-			}
-		};
+	async function handleAddAgent(slug: string) {
+		const persona = getPersona(slug);
+		if (!persona || activeAgentSlugs.has(slug)) return;
+
+		loadingAgents = new Set([...loadingAgents, slug]);
+
+		agentManager.setSocket(room.socket);
+		agentManager.setPeerConnection(pc);
+		agentManager.setHostSessionId(sessionId);
+
+		const trackName = await agentManager.addAgent(persona);
+		if (!trackName) {
+			loadingAgents = new Set([...loadingAgents].filter(s => s !== slug));
+			return;
+		}
 	}
+
+	function handleRemoveAgent(slug: string) {
+		agentManager.removeAgent(slug);
+		activeAgentSlugs = new Set([...activeAgentSlugs].filter(s => s !== slug));
+		agentStates = new Map([...agentStates].filter(([s]) => s !== slug));
+	}
+
+	function handleChatSend(text: string) {
+		room.sendChat(text);
+	}
+
+	async function pushAgentAudioTrack(slug: string) {
+		if (!pc || !sessionId || !cfCallsAvailable) return;
+
+		const trackInfo = agentManager.getTrackForAgent(slug);
+		if (!trackInfo) return;
+
+		await enqueueNegotiation(async () => {
+			if (!pc || !sessionId) return;
+
+			pc.addTransceiver(trackInfo.track, { direction: 'sendonly' });
+
+			const offer = await pc.createOffer();
+			await pc.setLocalDescription(offer);
+
+			const allTrackMappings: Array<{ trackName: string; mid: string }> = [];
+			for (const t of pc.getTransceivers()) {
+				if (!t.sender.track || !t.mid) continue;
+				if (t.sender.track === trackInfo.track) {
+					allTrackMappings.push({ trackName: trackInfo.trackName, mid: t.mid });
+				} else {
+					const existingName =
+						t.sender.track.kind === 'audio' ? localAudioTrackName :
+						t.sender.track.kind === 'video' ? localVideoTrackName :
+						localScreenTrackName;
+					if (existingName) {
+						allTrackMappings.push({ trackName: existingName, mid: t.mid });
+					}
+				}
+			}
+
+			const pushResult = await pushLocalTracks(sessionId, offer.sdp!, allTrackMappings);
+			if (pushResult.sessionDescription) {
+				await pc.setRemoteDescription(new RTCSessionDescription({
+					type: pushResult.sessionDescription.type,
+					sdp: pushResult.sessionDescription.sdp
+				}));
+			}
+
+			const agent = agentManager.getAgent(slug);
+			if (agent && room.socket) {
+				room.socket.send({
+					type: 'track-update-agent',
+					participantId: agent.participantId,
+					audioTrack: trackInfo.trackName,
+					sessionId: sessionId
+				} as any);
+			}
+
+			console.log('[Call] Agent audio track pushed for', slug);
+		});
+	}
+
 </script>
 
 <div class="flex h-dvh flex-col bg-base">
 	<div class="flex flex-1 flex-col overflow-hidden transition-[margin] duration-300 ease-in-out {chatOpen ? 'sm:mr-80' : 'mr-0'}">
-		<!-- Self-view strip (only when others are present and self isn't focused) -->
-		{#if hasRemotes && !focusedIsSelf}
-			<div class="flex shrink-0 items-center justify-center gap-2 px-2 py-1.5 sm:px-4 sm:py-2">
-				<button
-					onclick={() => { pinnedId = 'self'; }}
-					class="h-16 w-24 sm:h-[5.5rem] sm:w-36 cursor-pointer transition-transform duration-150 hover:scale-[1.03]"
-					title="Click to maximise your view"
-				>
+		<!-- Top strip: self-view (default) or other participants (when self is focused) -->
+		{#if hasRemotes && !selfScreenSharing}
+			{#if focusedIsSelf}
+				<div class="flex shrink-0 items-center justify-center gap-2 px-2 py-1.5 sm:px-4 sm:py-2 overflow-x-auto">
+					{#each room.otherParticipants as p (p.id)}
+						<button
+							onclick={() => { pinnedId = p.id; }}
+							class="h-16 w-24 sm:h-[5.5rem] sm:w-36 flex-shrink-0 cursor-pointer transition-transform duration-150 hover:scale-[1.03]
+								{recentlyJoinedAgents.has(p.id) ? 'animate-agent-entrance' : ''}"
+							title="Click to focus {p.name}"
+						>
+							<VideoTile
+								stream={participantStreams.get(p.id) || null}
+								name={p.name}
+								size="sm"
+								isAgent={!!p.isAgent}
+								avatarUrl={p.avatarUrl || ''}
+								agentState={getAgentStateForParticipant(p)}
+							/>
+						</button>
+					{/each}
+				</div>
+			{:else}
+				<div class="flex shrink-0 items-center justify-center gap-2 px-2 py-1.5 sm:px-4 sm:py-2">
+					<button
+						onclick={() => { pinnedId = 'self'; }}
+						class="h-16 w-24 sm:h-[5.5rem] sm:w-36 cursor-pointer transition-transform duration-150 hover:scale-[1.03]"
+						title="Click to maximise your view"
+					>
 					<VideoTile
 						stream={media.stream}
 						name="{userName} (You)"
@@ -861,29 +1209,42 @@
 						mirror={true}
 						showAudioLevel={true}
 						size="sm"
+						videoOff={!media.videoEnabled}
 					/>
-				</button>
-				{#if media.screenEnabled && media.screenStream}
-					<div class="relative hidden sm:block h-[5.5rem] w-36 overflow-hidden rounded-lg ring-1 ring-accent/30">
-						<video
-							autoplay
-							playsinline
-							muted
-							class="h-full w-full object-contain bg-black"
-							use:setScreenSrc={media.screenStream}
-						></video>
-						<div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1 pt-4">
-							<span class="text-[11px] text-accent font-medium">Screen share</span>
-						</div>
-					</div>
-				{/if}
-			</div>
+					</button>
+				</div>
+			{/if}
 		{/if}
 
 		<!-- Main area -->
 		<div class="relative flex-1 overflow-hidden px-1 pb-1 sm:px-3 sm:pb-3">
-			{#if !hasRemotes}
-				<!-- Alone: full self-view with invite pill -->
+			{#if selfScreenSharing}
+				<!-- Self screen sharing: screen as main, face in circle corner -->
+				<div class="h-full w-full {hasRemotes && thumbnailParticipants.length > 0 ? 'pb-24' : ''}">
+					<VideoTile
+						stream={media.screenStream}
+						name="Your screen"
+						muted={true}
+						contain={true}
+						size="lg"
+					/>
+				</div>
+				<div class="absolute bottom-20 right-4 sm:bottom-24 sm:right-6 z-10 h-20 w-20 sm:h-28 sm:w-28">
+					<VideoTile
+						stream={media.stream}
+						name="{userName}"
+						muted={true}
+						mirror={true}
+						circular={true}
+						size="sm"
+						videoOff={!media.videoEnabled}
+					/>
+				</div>
+				{#if hasRemotes && thumbnailParticipants.length > 0}
+					{@render thumbnailStrip(thumbnailParticipants)}
+				{/if}
+			{:else if !hasRemotes}
+				<!-- Alone, no screen share: full self-view -->
 				<div class="h-full w-full">
 					<VideoTile
 						stream={media.stream}
@@ -892,23 +1253,11 @@
 						mirror={true}
 						showAudioLevel={true}
 						size="lg"
+						videoOff={!media.videoEnabled}
 					/>
 				</div>
-				{#if !inviteVisible}
-					<div class="pointer-events-none absolute inset-0 flex items-end justify-center pb-24 sm:pb-28">
-						<button
-							onclick={() => controlBarRef?.openInvite()}
-							class="pointer-events-auto flex cursor-pointer items-center gap-2.5 rounded-xl border border-white/[0.08] bg-black/50 px-4 py-2.5 outline-none backdrop-blur-sm transition-all duration-150 hover:border-white/[0.14] hover:bg-black/60"
-						>
-							<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="text-accent">
-								<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>
-							</svg>
-							<span class="text-[13px] text-text-secondary">Invite someone to join</span>
-						</button>
-					</div>
-				{/if}
-			{:else if focusedIsSelf}
-				<div class="h-full w-full {thumbnailParticipants.length > 0 ? 'pb-24' : ''}">
+		{:else if focusedIsSelf}
+				<div class="h-full w-full">
 					<VideoTile
 						stream={media.stream}
 						name="{userName} (You)"
@@ -916,25 +1265,25 @@
 						mirror={true}
 						showAudioLevel={true}
 						size="lg"
+						videoOff={!media.videoEnabled}
 					/>
 				</div>
 				{@render unpinButton('Minimise')}
-
-				{#if room.otherParticipants.length > 0}
-					{@render thumbnailStrip(room.otherParticipants)}
-				{/if}
 			{:else if focusedParticipant}
 				<div class="h-full w-full {thumbnailParticipants.length > 0 ? 'pb-24' : ''}">
 					{#if focusedIsScreenShare}
+						<!-- Remote screen share: screen as main (contained), face in circle corner -->
 						<VideoTile
 							stream={screenStreams.get(focusedParticipant.id) || null}
 							name="{focusedParticipant.name}'s screen"
+							contain={true}
 							size="lg"
 						/>
-						<div class="absolute top-4 left-4 z-10 h-24 w-36">
+						<div class="absolute bottom-20 right-4 sm:bottom-24 sm:right-6 z-10 h-20 w-20 sm:h-28 sm:w-28">
 							<VideoTile
 								stream={participantStreams.get(focusedParticipant.id) || null}
 								name={focusedParticipant.name}
+								circular={true}
 								size="sm"
 							/>
 						</div>
@@ -943,6 +1292,9 @@
 							stream={participantStreams.get(focusedParticipant.id) || null}
 							name={focusedParticipant.name}
 							size="lg"
+							isAgent={!!focusedParticipant.isAgent}
+							avatarUrl={focusedParticipant.avatarUrl || ''}
+							agentState={getAgentStateForParticipant(focusedParticipant)}
 						/>
 					{/if}
 				</div>
@@ -962,11 +1314,13 @@
 		bind:this={controlBarRef}
 		audioEnabled={media.audioEnabled}
 		videoEnabled={media.videoEnabled}
+		speakerMuted={media.speakerMuted}
 		screenEnabled={media.screenEnabled}
 		{chatOpen}
 		{unreadChat}
 		{roomId}
-		showInvite={!hasRemotes}
+		showInvite={true}
+		isAlone={!hasRemotes}
 		mics={media.mics}
 		cameras={media.cameras}
 		speakers={media.speakers}
@@ -974,22 +1328,30 @@
 		selectedCamera={media.selectedCamera}
 		selectedSpeaker={media.selectedSpeaker}
 		{connectionQuality}
+		activeAgents={activeAgentSlugs}
+		{loadingAgents}
 		onToggleAudio={() => media.toggleAudio()}
 		onToggleVideo={() => media.toggleVideo()}
+		onToggleSpeaker={() => media.toggleSpeaker()}
 		onToggleScreen={handleToggleScreen}
 		onToggleChat={() => (chatOpen = !chatOpen)}
 		onLeave={handleLeave}
 		onSwitchMic={(id) => media.switchMic(id)}
 		onSwitchCamera={(id) => media.switchCamera(id)}
 		onSwitchSpeaker={(id) => media.switchSpeaker(id)}
-		onInviteOpenChange={(open) => { inviteVisible = open; }}
+		onInviteOpenChange={() => {}}
+		onAddAgent={handleAddAgent}
+		onRemoveAgent={handleRemoveAgent}
 	/>
 
 	<ChatPanel
 		open={chatOpen}
-		messages={room.chatMessages}
+		messages={chatPanelMessages}
 		myId={room.myId}
-		onSend={(text) => room.sendChat(text)}
+		agentParticipantIds={agentParticipantIds()}
+		{agentTypingIds}
+		agentNames={agentNames()}
+		onSend={handleChatSend}
 		onClose={() => (chatOpen = false)}
 	/>
 
@@ -1036,12 +1398,16 @@
 		{#each participants as p (p.id)}
 			<button
 				onclick={() => { pinnedId = p.id; }}
-				class="h-16 w-24 sm:h-20 sm:w-32 flex-shrink-0 cursor-pointer transition-transform duration-150 hover:scale-[1.04]"
+				class="h-16 w-24 sm:h-20 sm:w-32 flex-shrink-0 cursor-pointer transition-transform duration-150 hover:scale-[1.04]
+					{recentlyJoinedAgents.has(p.id) ? 'animate-agent-entrance' : ''}"
 			>
 				<VideoTile
 					stream={participantStreams.get(p.id) || null}
 					name={p.name}
 					size="md"
+					isAgent={!!p.isAgent}
+					avatarUrl={p.avatarUrl || ''}
+					agentState={getAgentStateForParticipant(p)}
 				/>
 			</button>
 		{/each}

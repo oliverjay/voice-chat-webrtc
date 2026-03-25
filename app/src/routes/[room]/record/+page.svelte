@@ -6,6 +6,7 @@
 	import { media } from '$lib/stores/media.svelte';
 	import { room } from '$lib/stores/room.svelte';
 	import { loadPreferences, getClientId } from '$lib/utils/preferences';
+	import { generateRandomName } from '$lib/utils/names';
 	import type { PreBriefClip } from '$lib/room/protocol';
 
 	const roomId = $derived($page.params.room ?? '');
@@ -13,7 +14,7 @@
 	const clientId = browser ? getClientId() : '';
 
 	if (browser) {
-		userName = loadPreferences().name || 'Anonymous';
+		userName = loadPreferences().name || generateRandomName();
 	}
 
 	function getRoomServerUrl() {
@@ -47,7 +48,7 @@
 
 	onMount(async () => {
 		const prefs = loadPreferences();
-		userName = prefs.name || 'Anonymous';
+		userName = prefs.name || generateRandomName();
 		await media.init();
 		if (media.stream && videoEl) {
 			videoEl.srcObject = media.stream;
